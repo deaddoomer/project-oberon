@@ -1,0 +1,114 @@
+MODULE Blinkers;   (*NW 17.4.2013*)
+  IMPORT SYSTEM, Display, Files, Input, Viewers, Texts, Oberon, Graphics, GraphicFrames;
+
+  TYPE Blinker* = POINTER TO BlinkDesc;
+    BlinkDesc* = RECORD (Graphics.ObjectDesc) END ;
+    BlinkMsg = RECORD (Graphics.Msg) END ;
+
+  VAR method: Graphics.Method;
+    T: Oberon.Task;
+
+  PROCEDURE New*;
+    VAR r: Blinker;
+  BEGIN NEW(r); r.do := method; Graphics.New(r)
+  END New;
+
+  PROCEDURE Copy(src, dst: Graphics.Object);
+  BEGIN dst.x := src.x; dst.y := src.y; dst.w := src.w; dst.h := src.h; dst.col := src.col
+  END Copy;
+
+  PROCEDURE mark(f: GraphicFrames.Frame; col, x, y: INTEGER);
+  BEGIN GraphicFrames.ReplConst(f, col, x, y, 4, 4, Display.replace)
+  END mark;
+
+  PROCEDURE Draw(obj: Graphics.Object; VAR M: Graphics.Msg);
+    VAR x, y, w, h, col: INTEGER; f: GraphicFrames.Frame;
+
+    PROCEDURE draw(f: GraphicFrames.Frame; col, x, y, w, h: INTEGER);
+    BEGIN
+      w := w DIV 2; h := h DIV 2;
+      GraphicFrames.ReplConst(f, Display.white, x, y, w, h, Display.replace);
+      GraphicFrames.ReplConst(f, Display.black, x+w, y, w, h, Display.replace);
+      GraphicFrames.ReplConst(f, Display.black, x, y+h, w, h, Display.replace);
+      GraphicFrames.ReplConst(f, Display.white, x+w, y+h, w, h, Display.replace)
+    END draw;
+
+  BEGIN
+    CASE M OF GraphicFrames.DrawMsg:
+      x := obj.x + M.x; y := obj.y + M.y; w := obj.w; h := obj.h; col := obj.col; f := M.f;
+      IF (x < f.X1) & (x+w > f.X) & (y < f.Y1) & (y+h > f.Y) THEN
+        IF M.mode = 0 THEN
+          draw(f, col, x, y, w, h);
+          IF obj.selected THEN mark(f, Display.white, x, y) END
+        ELSIF M.mode = 1 THEN mark(f, Display.white, x, y)  (*normal -> selected*)
+        ELSIF M.mode = 2 THEN mark(f, Display.black, x, y)   (*selected -> normal*)
+        ELSIF M.mode = 3 THEN GraphicFrames.ReplConst(f, Display.black, x, y, w, h, Display.replace)  (*erase*)
+        ELSIF M.mode = 4 THEN GraphicFrames.ReplConst(f, Display.white, x, y, w, h, Display.invert)  (*toggle*)
+        END
+      END
+    END
+  END Draw;
+
+  PROCEDURE Selectable(obj: Graphics.Object; x, y: INTEGER): BOOLEAN;
+  BEGIN
+    RETURN (obj.x <= x) & (x <= obj.x + 4) & (obj.y <= y) & (y <= obj.y + 4)
+  END Selectable;
+
+  PROCEDURE Change(obj: Graphics.Object; VAR M: Graphics.Msg);
+  BEGIN
+  END Change;
+
+  PROCEDURE Read(obj: Graphics.Object; VAR R: Files.Rider; VAR C: Graphics.Context);
+    VAR b: BYTE; len: INTEGER;
+  BEGIN Files.ReadByte(R, b); (*len*)
+  END Read;
+
+  PROCEDURE Write(obj: Graphics.Object; cno: INTEGER; VAR W: Files.Rider; VAR C: Graphics.Context);
+  BEGIN Graphics.WriteObj(W, cno, obj); Files.WriteByte(W, 0)
+  END Write;
+
+  PROCEDURE Blink*;
+    VAR v: Viewers.Viewer; G: GraphicFrames.Frame;
+      M: BlinkMsg; DM: GraphicFrames.DrawMsg;
+  BEGIN v := Oberon.FocusViewer;
+    IF (v # NIL) & (v.dsc # NIL) & (v.dsc.next IS GraphicFrames.Frame) THEN
+      G := v.dsc.next(GraphicFrames.Frame); Graphics.Change(G.graph, M);
+      DM.f := G; DM.x := G.x; DM.y := G.y; DM.col := Display.white; DM.mode := 4;
+      Graphics.Draw(G.graph, DM)
+    END
+  END Blink;
+
+  PROCEDURE Run*;
+  BEGIN Oberon.Install(T)
+  END Run;
+
+  PROCEDURE Stop*;
+  BEGIN Oberon.Remove(T)
+  END Stop;
+
+  PROCEDURE Make*;  (*command*)
+    VAR x0, x1, y0, y1: INTEGER;
+      B: Blinker;
+      G: GraphicFrames.Frame;
+  BEGIN G := GraphicFrames.Focus();
+    IF (G # NIL) & (G.mark.next # NIL) THEN
+      GraphicFrames.Deselect(G);
+      x0 := G.mark.x; y0 := G.mark.y; x1 := G.mark.next.x; y1 := G.mark.next.y;
+      NEW(B); B.col := Oberon.CurCol;
+      B.w := ABS(x1-x0); B.h := ABS(y1-y0);
+      IF x1 < x0 THEN x0 := x1 END ;
+      IF y1 < y0 THEN y0 := y1 END ;
+      B.x := x0 - G.x; B.y := y0 - G.y; B.col := Display.white; B.do := method;
+      Graphics.Add(G.graph, B);
+      GraphicFrames.Defocus(G); GraphicFrames.DrawObj(G, B)
+    END
+  END Make;
+
+BEGIN NEW(method);
+  method.module := "Blinkers"; method.allocator := "New";
+  method.new := New; method.copy := Copy; method.draw := Draw;
+  method.selectable := Selectable; method.change := Change;
+  method.read := Read; method.write := Write; (*method.print := Print*)
+  T := Oberon.NewTask(Blink, 500)
+END Blinkers.
+

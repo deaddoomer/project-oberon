@@ -1,0 +1,147 @@
+MODULE FileDir;   (*NW 12.1.86 / 23.8.90 / 15.8.2013*)
+  IMPORT SYSTEM, Kernel;
+
+  CONST FnLength*    = 32;
+        SecTabSize*   = 64;
+        ExTabSize*   = 12;
+        SectorSize*   = 1024;
+        IndexSize*   = SectorSize DIV 4;
+        HeaderSize*  = 352;
+        DirRootAdr*  = 29;
+        DirPgSize*   = 24;
+        DirMark*    = 9B1EA38DH;
+        HeaderMark* = 9BA71D86H;
+        FillerSize = 52;
+
+  TYPE DiskAdr      = INTEGER;
+    FileName*       = ARRAY FnLength OF CHAR;
+    SectorTable*    = ARRAY SecTabSize OF DiskAdr;
+    ExtensionTable* = ARRAY ExTabSize OF DiskAdr;
+    EntryHandler*   = PROCEDURE (name: FileName; sec: DiskAdr; VAR continue: BOOLEAN);
+
+    FileHeader* =
+      RECORD (*first page of each file on disk*)
+        mark*: INTEGER;
+        name*: FileName;
+        aleng*, bleng*, date*: INTEGER;
+        ext*:  ExtensionTable;
+        sec*: SectorTable;
+        fill: ARRAY SectorSize - HeaderSize OF BYTE;
+      END ;
+
+    FileHd* = POINTER TO FileHeader;
+    IndexSector* = ARRAY IndexSize OF DiskAdr;
+    DataSector* = ARRAY SectorSize OF BYTE;
+
+    DirEntry* =  (*B-tree node*)
+      RECORD
+        name*: FileName;
+        adr*:  DiskAdr; (*sec no of file header*)
+        p*:    DiskAdr  (*sec no of descendant in directory*)
+      END ;
+
+    DirPage*  =
+      RECORD mark*:  INTEGER;
+        m*:     INTEGER;
+        p0*:    DiskAdr;  (*sec no of left descendant in directory*)
+        fill:  ARRAY FillerSize OF BYTE;
+        e*:  ARRAY DirPgSize OF DirEntry
+      END ;
+
+  VAR fd: INTEGER;
+    syscall2: PROCEDURE (eax, ebx: INTEGER): INTEGER;
+    syscall3: PROCEDURE (eax, ebx, ecx: INTEGER): INTEGER;
+    syscall4: PROCEDURE (eax, ebx, ecx, edx: INTEGER): INTEGER;
+
+  PROCEDURE Check(s: ARRAY OF CHAR): INTEGER;
+    VAR i, res: INTEGER; ch: CHAR;
+  BEGIN ch := s[0]; i := 0;
+    IF (ch >= "A") & (ch <= "Z") OR (ch >= "a") & (ch <= "z") THEN
+      REPEAT INC(i); ch := s[i]
+      UNTIL ~((ch >= "0") & (ch <= "9") OR (ch >= "A") & (ch <= "Z")
+        OR (ch >= "a") & (ch <= "z") OR (ch = ".")) OR (i = FnLength);
+      IF i = FnLength THEN res := 4
+      ELSIF ch = 0X THEN res := 0;
+        WHILE i < FnLength DO INC(i) END
+      ELSE res := 5
+      END
+    ELSIF ch = 0X THEN res := -1
+    ELSE res := 3
+    END;
+    RETURN res
+  END Check;
+
+  (*Exported procedures: Search, Insert, Delete, Enumerate, Init*)
+
+  PROCEDURE Search*(name: FileName; VAR A: DiskAdr);
+    VAR res: INTEGER;
+  BEGIN A := 0;
+    IF Check(name) = 0 THEN (* access(name, R_OK|W_OK) *)
+      REPEAT res := syscall3(33, SYSTEM.ADR(name), 6) UNTIL res # -4;
+      IF res = 0 THEN A := -1 END
+    END
+  END Search;
+
+  PROCEDURE Insert*(name: FileName; fad: DiskAdr);
+  BEGIN ASSERT(FALSE)
+  END Insert;
+
+  PROCEDURE Delete*(name: FileName; VAR fad: DiskAdr);
+    VAR res: INTEGER;
+  BEGIN fad := 0;
+    IF Check(name) = 0 THEN
+      REPEAT res := syscall2(10, SYSTEM.ADR(name)) UNTIL res # -4; (*unlink*)
+      IF res = 0 THEN fad := -1 END
+    END
+  END Delete;
+
+  PROCEDURE Enumerate*(prefix: ARRAY OF CHAR; proc: EntryHandler);
+    CONST MaxEnt = 1024;
+    VAR res, i, j: INTEGER; pfx, nmx: CHAR;
+      buf: ARRAY MaxEnt OF CHAR;
+      continue: BOOLEAN;
+      name: FileName; 
+  BEGIN
+    IF fd > 0 THEN (*close*)
+      REPEAT res := syscall2(6, fd) UNTIL res # -4;
+      fd := -1
+    END;
+    IF Check(prefix) <= 0 THEN (* open(".", O_DIRECTORY | O_RDONLY,  0) *)
+      REPEAT fd := syscall4(5, SYSTEM.ADR("."), 10000H, 0) UNTIL fd # -4; 
+      IF fd >= 0 THEN
+        continue := TRUE;
+        REPEAT
+          REPEAT res := syscall4(220, fd, SYSTEM.ADR(buf), MaxEnt) UNTIL res # -4; (*getdents64*)
+          IF res > 0 THEN (*ok*)
+            j := 0;
+            REPEAT
+              IF buf[j+18] = 8X THEN (*regular file*)
+                i := 0;
+                REPEAT nmx := buf[j+i+19]; name[i] := nmx; pfx := prefix[i]; INC(i)
+                UNTIL (pfx # nmx) OR (nmx = 0X) OR (i >= FnLength);
+                IF (pfx = 0X) & ((nmx = 0X) OR (i < FnLength)) THEN (*match prefix, fit into buffer*)
+                  WHILE (nmx # 0X) & (i < FnLength) DO nmx := buf[j+i+19]; name[i] := nmx; INC(i) END;
+                  IF (nmx = 0X) & (Check(name) = 0) THEN (*name copied and valid*)
+                    proc(name, -1, continue)
+                  END
+                END
+              END;
+              INC(j, ORD(buf[j+17])*100H + ORD(buf[j+16]))
+            UNTIL j >= res
+          END
+        UNTIL ~continue OR (res <= 0);
+        REPEAT res := syscall2(6, fd) UNTIL res # -4; fd := -1 (*close*)
+      END
+    END
+  END Enumerate;
+
+(* ----- initialization ----- *)
+
+PROCEDURE Init*;
+  BEGIN fd := -1;
+    SYSTEM.PUT(SYSTEM.ADR(syscall2), SYSTEM.ADR($8B442408 8B5C2404 CD80 C20800 6690 90$));
+    SYSTEM.PUT(SYSTEM.ADR(syscall3), SYSTEM.ADR($8B44240C 8B5C2408 8B4C2404 CD80 C20C00 6690 90$));
+    SYSTEM.PUT(SYSTEM.ADR(syscall4), SYSTEM.ADR($8B442410 8B5C240C 8B4C2408 8B542404 CD80 C21000 6690 90$));
+  END Init; 
+  
+END FileDir.

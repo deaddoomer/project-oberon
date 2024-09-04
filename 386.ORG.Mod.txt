@@ -1,0 +1,2018 @@
+MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387 *)
+  IMPORT SYSTEM, Files, ORS, ORB;
+  (*Code generator for Oberon compiler for Intel 386/387 processor.
+     Procedural interface to Parser OSAP; result in array "code".
+     Procedure Close writes code-files*)
+
+  CONST WordSize* = 4;
+    CodeAlign = 128;
+
+    (*limits*)
+    maxCode = 40000; maxStrx = 3000; maxTD = 160;
+
+    (*register values*)
+    AX = 0; CX = 1; DX = 2; BX = 3; SP = 4; BP = 5; SI = 6; DI = 7;
+    NoReg = -1; off0 = 31; off8 = 30; off32 = 29; anyoffset = {off0, off8, off32};
+    reservedRegs = {SP, BP};
+    regs = {AX..DI} - reservedRegs;
+    ParOff = 8; TagOff = -4;
+
+    (*internal item modes*)
+    Reg = 10; RegI = 11; Cond = 12; FStk = 13;
+
+    (*frequently used opcodes*)
+    JccD32 = 0F80H; JccD8 = 70H; JmpD32 = 0E9H; JmpD8 = 0EBH;
+
+    (*condition codes*)
+    ccB = 2; ccAE = 3; ccBE = 6; ccA = 7;  (*unsigned*)
+    ccL = 12; ccGE = 13; ccLE = 14; ccG = 15;  (*signed*)
+    ccE = 4; ccNE = 5; ccS = 8; ccNS = 9; ccO = 0; ccNO = 1; ccP = 10; ccNP = 11;
+    ccTrue = -1; ccFalse = -2;
+
+    TYPE Item* = RECORD
+      mode*: INTEGER;
+      type*: ORB.Type;
+      a*, b*, r: LONGINT;
+      rdo*: BOOLEAN  (*read only*)
+    END ;
+
+  (* Item forms and meaning of fields:
+    mode    r      a       b
+    --------------------------------
+    Const   -     value (proc adr)  (immediate value)
+    Var     base   off     -               (direct adr)
+    Par      -     off0     off1         (indirect adr)
+    Reg    regno
+    RegI   regno   off     -
+    Cond  cond   Fchain  Tchain
+    FStk    -       -      -     *)
+
+  VAR pc*, varsize: LONGINT;   (*program counter, data index*)
+    tdx, strx: LONGINT;
+    entry: LONGINT;   (*main entry point*)
+    FH: LONGINT;  (*available fpu registers ST[0] ... ST[H-1]*)
+    parblocksize, procA, procB: LONGINT;
+    fixorgP, fixorgD, fixorgT: LONGINT;   (*origins of lists of locations to be fixed up by loader*)
+    check: BOOLEAN;  (*emit run-time checks*)
+    version: INTEGER;  (* 10 = Intel 386/387 *)
+    usedRegs: SET;
+
+    relmap, frelmap: ARRAY 6 OF INTEGER;  (*condition codes for relations*)
+    code: ARRAY maxCode OF BYTE;
+    data: ARRAY maxTD OF LONGINT;  (*type descriptors*)
+    str: ARRAY maxStrx OF CHAR;
+
+  (*instruction assemblers according to formats*)
+
+  PROCEDURE ThisByte(a: INTEGER): BYTE;
+  BEGIN RETURN code[a]
+  END ThisByte;
+
+  PROCEDURE ThisShort(a: INTEGER): INTEGER;
+  BEGIN RETURN ORD(code[a+1] * 256 + code[a])
+  END ThisShort;
+
+  PROCEDURE ThisWord(a: INTEGER): INTEGER;
+  BEGIN RETURN ORD((((code[a+3] * 256) + code[a+2]) * 256 + code[a+1]) * 256 + code[a])
+  END ThisWord;
+
+  PROCEDURE ThisStrWord(a: INTEGER): INTEGER;
+  BEGIN RETURN ((ORD(str[a+3])*256 + ORD(str[a+2]))*256 + ORD(str[a+1]))*256 + ORD(str[a])
+  END ThisStrWord;
+
+  PROCEDURE PutByte(a, x: INTEGER);
+  BEGIN code[a] := x
+  END PutByte;
+
+  PROCEDURE PutShort(a, x: INTEGER);
+  BEGIN PutByte(a, x); PutByte(a+1, x DIV 256)
+  END PutShort;
+
+  PROCEDURE PutWord(a, x: INTEGER);
+  BEGIN PutByte(a, x); PutByte(a+1, x DIV 256); PutByte(a+2, x DIV 65536); PutByte(a+3, x DIV 16777216)
+  END PutWord;
+
+  PROCEDURE PutStrWord(a, x: INTEGER);
+  BEGIN str[a] := CHR(x); str[a+1] := CHR(x DIV 100H); str[a+2] := CHR(x DIV 10000H); str[a+3] := CHR(x DIV 1000000H);
+  END PutStrWord;
+
+  PROCEDURE GenByte(x: INTEGER);
+  BEGIN PutByte(pc, x); INC(pc)
+  END GenByte;
+
+  PROCEDURE GenShort(x: INTEGER);
+  BEGIN PutShort(pc, x); INC(pc, 2)
+  END GenShort;
+
+  PROCEDURE GenWord(x: INTEGER);
+  BEGIN PutWord(pc, x); INC(pc, 4)
+  END GenWord;
+
+  PROCEDURE Gen1(op: INTEGER); (*prefix/opcode*)
+    (*emit multiple bytes*)
+    VAR i: INTEGER;
+  BEGIN i := 3;
+    WHILE (i > 0) & (ASR(op, i*8) MOD 256 = 0) DO DEC(i) END;
+    WHILE i >= 0 DO GenByte(ASR(op, i*8)); DEC(i) END
+  END Gen1;
+
+  PROCEDURE Gen2(op, r, reg: INTEGER); (*op r,reg*)
+    (*emit opcode with ModR/M reg/reg*)
+  BEGIN
+    ASSERT(r IN {AX..DI});
+    ASSERT(reg IN {AX..DI});
+    Gen1(op); GenByte(3 * 64 + r * 8 + reg)
+  END Gen2;
+
+  PROCEDURE Gen3(op, reg, base, offset: INTEGER; hint: SET); (*op reg,[base+offset]*)
+    (*emit opcode with ModR/M reg/mem*)
+    VAR mod, size: INTEGER;
+  BEGIN
+    ASSERT(reg IN {AX..DI});
+    ASSERT((base = NoReg) OR (base IN {AX..DI}));
+    ASSERT(hint * {off0, off8, off32} # {});
+    IF base = NoReg THEN ASSERT(off32 IN hint); mod := 0; base := BP; size := 4 (*mod=0 + base=BP => no-base + offset32*)
+    ELSIF (offset = 0) & (base # BP) & (off0 IN hint) THEN mod := 0; size := 0 (*no-offset*)
+    ELSIF (offset >= -128) & (offset <= 127) & (off8 IN hint) THEN mod := 1; size := 1 (*offset8*)
+    ELSE ASSERT(off32 IN hint); mod := 2; size := 4 (*offset32*)
+    END;
+    IF base = SP THEN (* [esp+offset] via SIB *)
+      Gen1(op); GenByte(mod * 64 + reg * 8 + SP); GenByte(0 * 64 + SP * 8 + SP)
+    ELSE (* [base+offset] *)
+      Gen1(op); GenByte(mod * 64 + reg * 8 + base)
+    END;
+    IF size = 1 THEN GenByte(offset)
+    ELSIF size = 4 THEN GenWord(offset)
+    END
+  END Gen3;
+
+  PROCEDURE Gen4(op, reg, scale, index, base, offset: INTEGER; hint: SET); (* op reg,[scale*index+base+offset] *)
+    (*same as Gen3, but with scale/index*)
+    VAR mod, size: INTEGER;
+  BEGIN
+    ASSERT(reg IN {AX..DI});
+    ASSERT(scale IN {0, 1, 2, 4, 8});
+    ASSERT((index = NoReg) OR (index IN {AX..DI} - {SP}));
+    ASSERT((base = NoReg) OR (base IN {AX..DI}));
+    IF (scale = 0) OR (index = NoReg) THEN (* [base+offset] *)
+      Gen3(op, reg, base, offset, hint);
+    ELSE (* [scale*index+base+offset] *)
+      IF base = NoReg THEN ASSERT(off32 IN hint); mod := 0; base := BP; size := 4 (* mod=0 + base=BP => no-base + offset32 *)
+      ELSIF (offset = 0) & (base # BP) & (off0 IN hint) THEN mod := 0; size := 0 (* no-offset *)
+      ELSIF (offset >= -128) & (offset <= 127) & (off8 IN hint) THEN mod := 1; size := 1 (* offset8 *)
+      ELSE ASSERT(off32 IN hint); mod := 2; size := 4 (* offset32 *)
+      END;
+      IF scale = 1 THEN scale := 0
+      ELSIF scale = 2 THEN scale := 1
+      ELSIF scale = 4 THEN scale := 2
+      ELSE scale := 3
+      END;
+      Gen1(op); GenByte(mod * 64 + reg * 8 + SP); GenByte(scale * 64 + index * 8 + base);
+      IF size = 1 THEN GenByte(offset)
+      ELSIF size = 4 THEN GenWord(offset)
+      END
+    END
+  END Gen4;
+
+  PROCEDURE incF;
+  BEGIN
+    IF FH < 8 THEN INC(FH) ELSE ORS.Mark("fpu stack overflow") END
+  END incF;
+
+  PROCEDURE decF;
+  BEGIN
+    IF FH > 0 THEN DEC(FH) ELSE ORS.Mark("fpu stack underflow") END
+  END decF;
+
+  PROCEDURE GetReg(hint: SET): INTEGER;
+    VAR reg: INTEGER; excl: SET;
+  BEGIN excl := usedRegs + reservedRegs;
+    reg := AX; WHILE (reg <= DI) & ((reg IN excl) OR ~(reg IN hint)) DO INC(reg) END;
+    IF reg > DI THEN
+      reg := AX; WHILE (reg <= DI) & (reg IN excl) DO INC(reg) END;
+      IF reg > DI THEN ORS.Mark("too many regs in use"); reg := AX END;
+    END;
+    INCL(usedRegs, reg);
+    RETURN reg
+  END GetReg;
+
+  PROCEDURE FreeReg(reg: INTEGER);
+  BEGIN
+    IF ~(reg IN reservedRegs) & (reg IN usedRegs) THEN EXCL(usedRegs, reg)
+    ELSE ORS.Mark("FreeReg")
+    END
+  END FreeReg;
+
+  PROCEDURE FreeItem(VAR x: Item);
+  BEGIN
+    IF x.mode = FStk THEN decF
+    ELSIF (x.mode = Reg) OR (x.mode = RegI) & (x.r # NoReg) & ~(x.r IN reservedRegs) THEN FreeReg(x.r)
+    END
+  END FreeItem;
+
+  PROCEDURE SaveReg(reg: INTEGER; workset: SET; VAR info: INTEGER);
+    VAR temp: INTEGER; set: SET;
+  BEGIN ASSERT(reg IN {AX..DI}); ASSERT(reg IN workset);
+    IF reg IN usedRegs THEN
+      temp := 0; set := reservedRegs + usedRegs + workset;
+      WHILE (temp < 8) & (temp IN set) DO INC(temp) END;
+      IF temp >= 8 THEN ORS.Mark("too many regs in use"); temp := AX END;
+      INCL(usedRegs, temp); Gen2(8BH, temp, reg); info := temp (*mov i,reg*)
+    ELSE INCL(usedRegs, reg); info := reg
+    END
+  END SaveReg;
+
+  PROCEDURE RestoreReg(reg, info: INTEGER);
+  BEGIN ASSERT(reg IN {AX..DI}); ASSERT(info IN {AX..DI});
+    IF reg # info THEN
+      Gen2(8BH, reg, info) (* mov i,reg *)
+    END;
+    FreeReg(info)
+  END RestoreReg;
+
+  PROCEDURE CheckRegs*;
+  BEGIN
+    IF FH # 0 THEN ORS.Mark("FPU Stack"); FH := 0 END ;
+    IF usedRegs # reservedRegs THEN ORS.Mark("Reg Stack"); usedRegs := reservedRegs END ;
+    IF pc >= maxCode - 40 THEN ORS.Mark("program too long") END ;
+  END CheckRegs;
+
+  PROCEDURE SetCC(VAR x: Item; n: LONGINT);
+  BEGIN x.mode := Cond; x.a := 0; x.b := 0; x.r := n
+  END SetCC;
+
+  PROCEDURE Trap(cond, num: LONGINT);
+    VAR pc0, disp, op: INTEGER; x: Item;
+  BEGIN
+    IF cond # ccFalse THEN
+      IF cond # ccTrue THEN
+        IF ODD(cond) THEN op := JccD8 + cond - 1 ELSE op := JccD8 + cond + 1 END;
+        Gen1(op); pc0 := pc; GenByte(0)
+      END;
+      Gen1(68H); GenWord(ORS.Pos() * 100H + num); (*push c*)
+      Gen3(0FFH, 2, NoReg, 0, {off32}); (*call [MTOrg]*)
+      disp := (pc - 4) - fixorgD;
+      IF disp < 4096 THEN PutWord(pc - 4, -1 * 10000H + disp); fixorgD := pc - 4
+      ELSE ORS.Mark("fixup impossible")
+      END;
+      IF cond # ccTrue THEN PutByte(pc0, pc - (pc0 + 1)) END
+    END
+  END Trap;
+
+  PROCEDURE fixvar(mno, vno: INTEGER);  (* insert data fixup into last word *)
+    (* fixorgD fixup format: offset 16 bit + mno 4 bit + disp 12 bit; vno=FFFFH used to get module table *)
+    VAR disp: INTEGER;
+  BEGIN
+    disp := (pc - 4) - fixorgD;
+    IF (disp < 4096) & (vno < 0FFFFH) THEN
+      PutWord(pc - 4, vno * 10000H + (-mno) * 1000H + disp); fixorgD := pc - 4
+    ELSE ORS.Mark("fixup impossible")
+    END
+  END fixvar;
+
+  PROCEDURE fixcode (mno, pno: INTEGER; rel: BOOLEAN);
+    (* fixorgP format: offset 14 bit + mno 4 bit  + disp 14 bit *)
+    VAR disp: INTEGER; error: BOOLEAN;
+  BEGIN
+    disp := (pc - 4) - fixorgP;
+    IF mno = 0 THEN (*dword-aligned procedure address*)
+      ASSERT(pno MOD 4 = 0); pno := pno DIV 4; error := rel OR (pno >= 16384)
+    ELSE error := pno >= 8192;
+      IF rel THEN pno := -pno END
+    END;
+    IF ~error & (disp < 16384) THEN
+      PutWord(pc - 4, pno * 40000H + (-mno) * 4000H + disp); fixorgP := pc - 4;
+    ELSE ORS.Mark("fixup impossible")
+    END
+  END fixcode;
+
+  (*handling of forward reference, fixups of branch addresses and constant tables*)
+
+  PROCEDURE negated(cond: LONGINT): LONGINT;
+  BEGIN
+    IF ODD(cond) THEN DEC(cond) ELSE INC(cond) END;
+    RETURN cond
+  END negated;
+
+  PROCEDURE reverse(op: INTEGER): INTEGER;
+  BEGIN
+    IF op = ORS.lss THEN op := ORS.gtr
+    ELSIF op = ORS.leq THEN op := ORS.geq
+    ELSIF op = ORS.gtr THEN op := ORS.lss
+    ELSIF op = ORS.geq THEN op := ORS.leq
+    END;
+    RETURN op
+  END reverse;
+
+  PROCEDURE FixOne*(at: LONGINT);
+  BEGIN PutWord(at, pc - (at + 4))
+  END FixOne;
+
+  PROCEDURE FixLink*(L: LONGINT);
+    VAR L1: LONGINT;
+  BEGIN
+    WHILE L # 0 DO L1 := ThisWord(L); PutWord(L, pc - (L + 4)); L := L1 END;
+  END FixLink;
+
+  PROCEDURE FixLinkWith(L0, dst: LONGINT);
+    VAR L1: LONGINT;
+  BEGIN
+    WHILE L0 # 0 DO
+      L1 := ThisWord(L0);
+      PutWord(L0, dst - (L0 + 4)); L0 := L1
+    END
+  END FixLinkWith;
+
+  PROCEDURE merged(L0, L1: LONGINT): LONGINT;
+    VAR L2, L3: LONGINT;
+  BEGIN
+    IF L0 # 0 THEN L3 := L0;
+      REPEAT L2 := L3; L3 := ThisWord(L2) UNTIL L3 = 0;
+      PutWord(L2, L1); L1 := L0
+    END ;
+    RETURN L1
+  END merged;
+
+  (* loading of operands and addresses into registers *)
+
+  PROCEDURE GenWordAdr(VAR x: Item; rel: BOOLEAN);
+  BEGIN
+    GenWord(0);
+    IF (x.mode = ORB.Const) & (x.type.form = ORB.Proc) THEN
+      IF x.r > 0 THEN ORS.Mark("not allowed")
+      ELSE fixcode(x.r, x.a, rel)
+      END
+    ELSIF (x.mode = ORB.Var) & (x.r <= 0) THEN fixvar(x.r, x.a)
+    ELSE ORS.Mark("address error")
+    END
+  END GenWordAdr;
+
+  PROCEDURE Gen3v(op, reg: INTEGER; VAR x: Item);
+    VAR base: INTEGER;
+  BEGIN
+    IF (x.mode = ORB.Const) & (x.type.form = ORB.Proc) THEN
+      IF x.r > 0 THEN ORS.Mark("not allowed")
+      ELSE Gen3(op, reg, NoReg, 0, {off32}); fixcode(x.r, x.a, FALSE)
+      END
+    ELSIF x.mode = ORB.Var THEN
+      IF x.r > 0 THEN Gen3(op, reg, BP, x.a, anyoffset)
+      ELSE Gen3(op, reg, NoReg, 0, {off32}); fixvar(x.r, x.a)
+      END
+    ELSIF x.mode = ORB.Par THEN
+      base := GetReg(regs);
+      Gen3(8BH, base, BP, x.a, anyoffset); (* mov reg,PTR[ebp+offset] *)
+      Gen3(op, reg, base, x.b, anyoffset); (* op reg,[base+offset2] *)
+      FreeReg(base)
+    ELSIF x.mode = Reg THEN
+      Gen2(op, reg, x.r)
+    ELSIF x.mode = RegI THEN
+      Gen3(op, reg, x.r, x.a, anyoffset)
+    ELSE ORS.Mark("bad address")
+    END;
+  END Gen3v;
+
+  PROCEDURE mov(r: INTEGER; VAR x: Item);
+    VAR op: INTEGER;
+  BEGIN
+    ASSERT(r IN {AX..DI});
+    IF x.type.size = 1 THEN op := 0FB6H ELSE op := 8BH END; (* movxz r32,rm / mov r32,rm *)
+    IF x.mode = ORB.Const THEN (* mov reg,imm32 *)
+      IF x.type.form = ORB.Proc THEN
+        IF x.r > 0 THEN ORS.Mark("not allowed")
+        ELSE Gen1(0B8H + r); GenWord(0); fixcode(x.r, x.a, FALSE)
+        END
+      ELSE Gen1(0B8H + r); GenWord(x.a)
+      END
+    ELSIF x.mode = ORB.Var THEN
+      IF x.r > 0 THEN Gen3(op, r, BP, x.a, anyoffset) (* local *)
+      ELSIF (r = AX) & (x.type.size = 4) THEN Gen1(0A1H); GenWord(0); fixvar(x.r, x.a)
+      ELSE Gen3(op, r, NoReg, 0, {off32}); fixvar(x.r, x.a)
+      END
+    ELSIF x.mode = ORB.Par THEN
+      Gen3(8BH, r, BP, x.a, anyoffset); (* mov r32,[ebp+adr] *)
+      Gen3(op, r, r, x.b, anyoffset); (* mov r,[r+offset] *)
+    ELSIF x.mode = Reg THEN
+      IF r # x.r THEN
+        Gen2(8BH, r, x.r) (* mov r,x *)
+      END
+    ELSIF x.mode = RegI THEN
+      IF (x.r # NoReg) & ~(x.r IN usedRegs) THEN ORS.Mark("mov error") END;
+      IF (r = AX) & (x.r = NoReg) & (x.type.size = 4) THEN Gen1(0A1H); GenWord(x.a)
+      ELSE Gen3(op, r, x.r, x.a, anyoffset)
+      END;
+    ELSIF x.mode = Cond THEN
+      IF x.r = ccTrue THEN
+        FixLink(x.b); FixLink(x.a); Gen1(0B8H + r); GenWord(1) (* mov r,1 *)
+      ELSIF x.r = ccFalse THEN
+        FixLink(x.a); FixLink(x.b); Gen1(0B8H + r); GenWord(0)  (* mov r,0 *)
+      ELSIF x.r IN {0..15} THEN
+        Gen1(JccD8 + negated(x.r)); GenByte(7);
+        FixLink(x.b); Gen1(0B8H + r); GenWord(1); Gen1(JmpD8); GenByte(5);
+        FixLink(x.a); Gen1(0B8H + r); GenWord(0);
+      ELSE ORS.Mark("invalid cc")
+      END
+    ELSIF x.mode = FStk THEN
+      Gen3(8DH, SP, SP, -4, anyoffset); (* lea esp,[esp-4] *)
+      IF x.type.form = ORB.Real THEN Gen3(0D9H, 2, SP, 0, anyoffset) (* fst float32[esp] *)
+      ELSE Gen3(0DBH, 2, SP, 0, anyoffset) (* fist int32[esp] *)
+      END;
+      Gen1(58H + r); (* pop r *)
+    ELSE ORS.Mark("mov error")
+    END
+  END mov;
+  
+  PROCEDURE lea(r: INTEGER; VAR x: Item);
+  BEGIN
+    ASSERT(r IN {AX..DI});
+    IF (x.mode = ORB.Const) & (x.type.form = ORB.Proc) THEN
+      IF x.r > 0 THEN ORS.Mark("not allowed")
+      ELSE Gen1(0B8H + r); GenWord(0); fixcode(x.r, x.a, FALSE) (* mov reg,adr *)
+      END
+    ELSIF x.mode = ORB.Var THEN
+      IF x.r > 0 THEN Gen3(8DH, r, BP, x.a, anyoffset) (* lea reg,[ebp+offset] *)
+      ELSE Gen1(0B8H + r); GenWord(0); fixvar(x.r, x.a) (* mov reg,adr *)
+      END
+    ELSIF x.mode = ORB.Par THEN
+      Gen3(8BH, r, BP, x.a, anyoffset); (* mov reg,PTR[ebp+offset1] *)
+      IF x.b # 0 THEN Gen3(8DH, r, r, x.b, anyoffset) END (* lea reg,[reg+offset2] *)
+    ELSIF x.mode = RegI THEN
+      IF x.a = 0 THEN Gen2(8BH, r, x.r) (* mov r,x *)
+      ELSE Gen3(8DH, r, x.r, x.a, anyoffset) (* lea reg,[reg+offset] *)
+      END
+    ELSE ORS.Mark("address error")
+    END
+  END lea;
+
+  PROCEDURE load(VAR x: Item; hint: SET);
+    VAR r: LONGINT;
+  BEGIN
+    IF x.mode # Reg THEN
+      IF x.mode = RegI THEN
+        IF (x.r # NoReg) & ~(x.r IN usedRegs) THEN ORS.Mark("load error") END;
+        IF (x.r = NoReg) OR (x.r IN reservedRegs) THEN r := GetReg(hint) ELSE r := x.r END;
+        mov(r, x);
+        IF (x.r # NoReg) & ~(x.r IN reservedRegs) & (x.r # r) THEN FreeItem(x) END
+      ELSIF x.mode =  FStk THEN
+        r := GetReg(hint);
+        Gen3(8DH, SP, SP, -4, anyoffset); (* lea esp,[esp-4] *)
+        IF x.type.form = ORB.Real THEN Gen3(0D9H, 3, SP, 0, anyoffset) (* fstp float32[esp] *)
+        ELSE Gen3(0DBH, 3, SP, 0, anyoffset) (* fistp int32[esp] *)
+        END;
+        Gen1(58H + r); (* pop r *)
+        decF
+      ELSE r := GetReg(hint); mov(r, x)
+      END;
+      x.mode := Reg; x.r := r
+    END
+  END load;
+
+  PROCEDURE loadAdr(VAR x: Item; hint: SET);
+    VAR reg: INTEGER;
+  BEGIN
+    IF x.mode = RegI THEN
+      IF (x.r # NoReg) & ~(x.r IN usedRegs) THEN ORS.Mark("loadAdr error") END;
+      IF  (x.r = NoReg) OR (x.r IN reservedRegs) THEN reg := GetReg(hint) ELSE reg := x.r END;
+      lea(reg, x);
+      IF (x.r # NoReg) & ~(x.r IN reservedRegs) & (x.r # reg) THEN FreeReg(x.r) END;
+    ELSIF x.mode # Reg THEN
+      reg := GetReg(hint); lea(reg, x)
+    ELSE ORS.Mark("address error"); reg := AX
+    END;
+    x.mode := Reg; x.r := reg
+  END loadAdr;
+
+  PROCEDURE cmp(VAR x, y: Item);
+    VAR op, reg: INTEGER;
+  BEGIN
+    IF (x.mode = Reg) & (y.mode = ORB.Const) & (y.a = 0) THEN
+      Gen2(85H, x.r, x.r) (* test r32,r32 *)
+    ELSIF (x.mode = Reg) & (y.mode = Reg) THEN
+      Gen3v(3BH, x.r, y) (* cmp reg32,r/m32 *)
+    ELSIF (x.mode = Reg) & (y.mode IN {ORB.Var, ORB.Par, RegI}) THEN
+      IF y.type.size = 1 THEN
+        IF x.r IN {SP..DI} THEN
+          reg := GetReg(regs - {SP..DI});
+          IF reg IN {SP..DI} THEN ORS.Mark("too many regs in use") END;
+          mov(reg, x); Gen3v(3AH, reg, y); FreeReg(reg) (* cmp reg8,r/m8 *)
+        ELSE Gen3v(3AH, x.r, y) (* cmp reg8,r/m8 *)
+        END
+      ELSE Gen3v(3BH, x.r, y) (* cmp reg32,r/m32 *)
+      END
+    ELSIF (x.mode IN {ORB.Var, ORB.Par, RegI}) & (y.mode = Reg) THEN
+      IF x.type.size = 1 THEN
+        IF y.r IN {SP..DI} THEN
+          reg := GetReg(regs - {SP..DI});
+          IF reg IN {SP..DI} THEN ORS.Mark("too many regs in use") END;
+          mov(reg, y); Gen3v(38H, reg, x); FreeReg(reg) (* cmp r/m8,reg8 *)
+        ELSE Gen3v(38H, y.r, x)
+        END
+      ELSE Gen3v(39H, y.r, x) (* cmp r/m32,reg32 *)
+      END
+    ELSIF (x.mode IN {ORB.Var, ORB.Par, Reg, RegI}) & (y.mode = ORB.Const) THEN
+      IF y.type.form = ORB.Proc THEN
+        IF (x.mode = Reg) & (x.r = AX) THEN Gen1(3DH) (* cmp eax,imm32 *)
+        ELSE Gen3v(81H, 7, x) (* cmp r/m32,imm32 *)
+        END;
+        GenWordAdr(y, FALSE)
+      ELSIF x.mode = Reg THEN
+        IF (y.a >= -128) & (y.a <= 127) THEN
+          IF (x.type.size = 1) & ~(x.r IN {SP..DI}) THEN
+            IF x.r = AX THEN Gen1(3CH); GenByte(y.a) (* cmp al,imm8 *)
+            ELSE Gen2(80H, 7, x.r); GenByte(y.a) (* cmp reg8,imm8 *)
+            END
+          ELSE Gen2(83H, 7, x.r); GenByte(y.a) (* cmp reg32,imm8 *)
+          END
+        ELSIF x.r = AX THEN Gen1(3DH); GenWord(y.a) (* cmp eax,imm32 *)
+        ELSE Gen2(81H, 7, x.r); GenWord(y.a) (* cmp reg32,imm32 *)
+        END
+      ELSIF x.type.size = 1 THEN
+        IF (y.a >= -128) & (y.a <= 127) THEN Gen3v(80H, 7, x); GenByte(y.a) (* cmp r/m8,imm8 *)
+        ELSE reg := GetReg(regs); mov(reg, x); Gen2(81H, 7, x.r); GenWord(y.a); FreeReg(reg) (* cmp reg32,imm32 *)
+        END
+      ELSE
+        IF (y.a >= -128) & (y.a <= 127) THEN Gen3v(83H, 7, x); GenByte(y.a) (* cmp r/m32,imm8 *)
+        ELSE Gen3v(81H, 7, x); GenWord(y.a) (* cmp r/m32,imm32 *)
+        END
+      END
+    ELSE ORS.Mark("invalid cmp mode")
+    END
+  END cmp;
+
+  PROCEDURE cmpcon(VAR x: Item; y: INTEGER);
+    VAR z: Item;
+  BEGIN z.mode := ORB.Const; z.type := x.type; z.a := y; cmp(x, z)
+  END cmpcon;
+
+  PROCEDURE loadMemReg(VAR x: Item; targetSize: INTEGER; hint: SET);
+  BEGIN
+    IF (x.type.size < targetSize) OR (x.mode = ORB.Const) & (x.type.form # ORB.Proc) OR
+        ~(x.mode IN {ORB.Var, ORB.Par, RegI, Reg}) THEN
+      load(x, hint)
+    END
+  END loadMemReg;
+
+  PROCEDURE push(VAR x: Item);
+  BEGIN
+    IF x.mode = ORB.Const THEN (*push imm*)
+      IF x.type.form = ORB.Proc THEN Gen1(68H); GenWordAdr(x, FALSE)
+      ELSIF (x.a >= -128) & (x.a <= 127) THEN Gen1(6AH); GenByte(x.a)
+      ELSE Gen1(68H); GenWord(x.a)
+      END
+    ELSIF x.mode = FStk THEN
+      Gen3(8DH, SP, SP, -4, anyoffset); (*lea esp,[esp-4]*)
+      IF x.type.form = ORB.Real THEN Gen3(0D9H, 3, SP, 0, anyoffset) (* fstp float32[esp] *)
+      ELSE Gen3(0DBH, 3, SP, 0, anyoffset) (*fistp int32[esp]*)
+      END;
+      decF
+    ELSE
+      loadMemReg(x, 4, regs);
+      IF x.mode = Reg THEN Gen1(50H + x.r) (*push reg32*)
+      ELSE Gen3v(0FFH, 6, x) (*push m32*)
+      END;
+      FreeItem(x)
+    END
+  END push;
+
+  PROCEDURE MakeConstVarItem (VAR x: Item; typ: ORB.Type; val: INTEGER);
+    VAR a: INTEGER;
+  BEGIN a := 0;
+    WHILE (a < strx) & (ThisStrWord(a) # val) DO INC(a, 4) END; (*find existing value*)
+    IF a >= strx THEN
+      IF a + 4 < maxStrx THEN PutStrWord(a, val); INC(strx, 4)
+      ELSE ORS.Mark("too many strings")
+      END
+    END;
+    x.mode := ORB.Var; x.type := typ; x.r := 0; x.a := varsize + a
+  END MakeConstVarItem;
+
+  PROCEDURE loadFloat(VAR x: Item);
+    VAR op, mode, form, base: INTEGER;
+  BEGIN mode := x.mode; form := x.type.form;
+    IF mode # FStk THEN
+      IF form = ORB.Real THEN op := 0D9H ELSE op := 0DBH END; (*m32fp/m32int*)
+      IF (mode = ORB.Const) & (form IN {ORB.Byte..ORB.Set}) THEN
+        IF x.a = 0 THEN Gen1(0D9EEH) (*fldz*)
+        ELSIF (form = ORB.Real) & (x.a = 3F800000H) THEN Gen1(0D9E8H) (*fld1*)
+        ELSIF (form # ORB.Real) & (x.a = 1) THEN Gen1(0D9E8H) (*fld1*)
+        ELSE MakeConstVarItem(x, x.type, x.a); Gen3v(op, 0, x) (*fld*)
+        END
+      ELSIF mode IN {ORB.Var, ORB.Par, RegI} THEN
+        Gen3v(op, 0, x); FreeItem(x) (*fld*)
+      ELSE
+        push(x);
+        Gen3(op, 0, SP, 0, anyoffset); (*fld [esp]*)
+        Gen3(8DH, SP, SP, 4, anyoffset); (*lea esp,[esp+4]*)
+      END;
+      x.mode := FStk; x.type := ORB.realType; incF
+    END
+  END loadFloat;
+
+  PROCEDURE loadCond(VAR x: Item);
+  BEGIN
+    IF x.type.form = ORB.Bool THEN
+      IF x.mode = ORB.Const THEN
+        IF x.a = 0 THEN x.r := ccFalse ELSE x.r := ccTrue END
+      ELSE loadMemReg(x, x.type.size, {AX}); cmpcon(x, 0); FreeItem(x); x.r := ccNE
+      END;
+      x.mode := Cond; x.a := 0; x.b := 0
+    ELSE ORS.Mark("not Boolean?")
+    END
+  END loadCond;
+
+  PROCEDURE loadTypTagAdr(VAR x: Item; T: ORB.Type; hint: SET);
+  BEGIN x.mode := ORB.Var; x.a := T.len; x.r := -T.mno; loadAdr(x, hint)
+  END loadTypTagAdr;
+
+  PROCEDURE loadStringAdr(VAR x: Item; hint: SET);
+    VAR reg: INTEGER;
+  BEGIN
+    reg := GetReg(hint);
+    Gen1(0B8H + reg); GenWord(0); fixvar(0, varsize + x.a);
+    x.mode := Reg; x.r := reg
+  END loadStringAdr;
+
+  (* Items: Conversion from constants or from Objects on the Heap to Items on the Stack*)
+
+  PROCEDURE MakeConstItem*(VAR x: Item; typ: ORB.Type; val: LONGINT);
+  BEGIN x.mode := ORB.Const; x.type := typ; x.a := val
+  END MakeConstItem;
+
+  PROCEDURE MakeRealItem*(VAR x: Item; val: REAL);
+  BEGIN x.mode := ORB.Const; x.type := ORB.realType; x.a := SYSTEM.VAL(LONGINT, val)
+  END MakeRealItem;
+
+  PROCEDURE MakeStringItem*(VAR x: Item; len: LONGINT); (*copies string from ORS-buffer to ORG-string array*)
+    VAR i: LONGINT;
+  BEGIN x.mode := ORB.Const; x.type := ORB.strType; x.a := strx; x.b := len; i := 0;
+    IF strx + len + 4 < maxStrx THEN
+      WHILE len > 0 DO str[strx] := ORS.str[i]; INC(strx); INC(i); DEC(len) END ;
+      WHILE strx MOD 4 # 0 DO str[strx] := 0X; INC(strx) END
+    ELSE ORS.Mark("too many strings")
+    END
+  END MakeStringItem;
+
+  PROCEDURE MakeItem*(VAR x: Item; y: ORB.Object; curlev: LONGINT);
+  BEGIN x.mode := y.class; x.type := y.type; x.a := y.val; x.rdo := y.rdo;
+    IF y.class = ORB.Par THEN x.b := 0
+    ELSIF (y.class = ORB.Const) & (y.type.form = ORB.String) THEN x.b := y.lev  (*len*) ;
+    ELSE x.r := y.lev
+    END ;
+    IF (y.lev > 0) & (y.lev # curlev) & (y.class # ORB.Const) THEN ORS.Mark("not accessible ") END
+  END MakeItem;
+
+  (* Code generation for basic operations *)
+
+  PROCEDURE xchg(a, b: INTEGER);
+    VAR t: INTEGER;
+  BEGIN
+    IF a # b THEN
+      IF b = AX THEN b := a; a := AX END; (* preffer eax as dst *)
+      IF a = AX THEN Gen1(90H + b) (* xchg eax,RB *)
+      ELSE Gen2(87H, a, b) (* xchg RA,RB *)
+      END
+    END
+  END xchg;
+
+  PROCEDURE shift(fct: INTEGER; VAR x, y: Item; hint: SET; fse: BOOLEAN);
+    VAR op, r: INTEGER; usecx: BOOLEAN;
+  BEGIN
+    IF fct = 0 THEN op := 4 (* shl *) ELSIF fct = 1 THEN op := 7 (* sar *) ELSE op := 1 (* ror *) END;
+    IF y.mode = ORB.Const THEN
+      IF y.a # 0 THEN
+        load(x, hint);
+        IF ~fse & (fct = 0) THEN (* shl *)
+          IF y.a = 1 THEN Gen4(8DH, x.r, 2, x.r, NoReg, 0, anyoffset) (* lea x,[x*2] *)
+          ELSIF y.a = 2 THEN Gen4(8DH, x.r, 4, x.r, NoReg, 0, anyoffset) (* lea x,[x*4] *)
+          ELSIF y.a = 3 THEN Gen4(8DH, x.r, 8, x.r, NoReg, 0, anyoffset) (* lea x,[x*8] *)
+          ELSE Gen2(0C1H, op, x.r); GenByte(y.a) (* shl r32,imm8 *)
+          END
+        ELSIF y.a = 1 THEN Gen2(0D1H, op, x.r) (* shl r32,1 *)
+        ELSE Gen2(0C1H, op, x.r); GenByte(y.a) (* shl r32,imm8 *)
+        END
+      END
+    ELSE
+      load(x, hint - {CX}); load(y, {CX});
+      usecx := FALSE;
+      IF y.r # CX THEN
+        IF x.r = CX THEN xchg(y.r, x.r); r := y.r; y.r := x.r; y.r := r
+        ELSE usecx := TRUE; xchg(y.r, CX)
+        END
+      END;
+      Gen2(0D3H, op, x.r); (* shl x,cl *)
+      IF usecx THEN xchg(CX, y.r) END;
+      FreeReg(y.r)
+    END
+  END shift;
+
+  PROCEDURE addop(op: INTEGER; VAR x, y: Item; hint: SET; fse: BOOLEAN);
+    VAR subop, val: INTEGER;
+  BEGIN
+    IF (x.mode = ORB.Const) & (y.mode = ORB.Const) THEN
+      IF op = ORS.plus THEN x.a := x.a + y.a ELSE x.a := x.a - y.a END
+    ELSIF y.mode = ORB.Const THEN
+      IF fse THEN (*force side effects*)
+        IF (y.a >= -128) & (y.a <= 127) THEN
+          load(x, hint);
+          IF op = ORS.plus THEN Gen2(83H, 0, x.r) ELSE Gen2(83H, 5, x.r) END;
+          GenByte(y.a)
+        ELSE load(x, {AX});
+          IF x.r = AX THEN
+            IF op = ORS.plus THEN Gen1(5H); GenWord(y.a)
+            ELSE Gen1(2DH); GenWord(y.a)
+            END
+          ELSE
+            IF op = ORS.plus THEN Gen2(81H, 0, x.r); GenWord(y.a)
+            ELSE Gen2(81H, 5, x.r); GenWord(y.a)
+            END
+          END
+        END
+      ELSE
+        IF op = ORS.plus THEN val := y.a ELSE val := -y.a END;
+        load(x, hint); Gen3(8DH, x.r, x.r, val, anyoffset) (* lea reg,[reg+val] *)
+      END
+    ELSE
+      load(x, hint); loadMemReg(y, 4, hint); 
+      IF op = ORS.plus THEN
+        IF ~fse & (y.mode = Reg) THEN Gen4(8DH, x.r, 1, x.r, y.r, 0, anyoffset) (* lea x,[x+r] *)
+        ELSE Gen3v(03H, x.r, y)
+        END
+      ELSE Gen3v(2BH, x.r, y)
+      END;
+      FreeItem(y)
+    END
+  END addop;
+
+  PROCEDURE log2(m: LONGINT; VAR e: LONGINT): LONGINT;
+  BEGIN e := 0;
+    WHILE ~ODD(m) DO m := m DIV 2; INC(e) END ;
+    RETURN m
+  END log2;
+
+  PROCEDURE mul(VAR x, y: Item; hint: SET; fse: BOOLEAN);
+    VAR e, reg: INTEGER; temp: Item;
+  BEGIN
+    IF (x.mode = ORB.Const) & (y.mode = ORB.Const) THEN x.a := x.a * y.a
+    ELSIF (x.mode = ORB.Const) & (x.a = 0) OR (y.mode = ORB.Const) & (y.a = 0) THEN
+      FreeItem(x); FreeItem(y); x.mode := ORB.Const; x.a := 0
+    ELSIF ~fse & (x.mode = ORB.Const) & (x.a = 1) THEN x := y
+    ELSIF ~fse & (y.mode = ORB.Const) & (y.a = 1) THEN (* nop *)
+    ELSIF (x.mode = ORB.Const) OR (y.mode = ORB.Const) THEN
+      IF y.mode # ORB.Const THEN temp := x; x := y; y := temp END;
+      IF (y.mode = ORB.Const) & (y.a >= 2) & (log2(y.a, e) = 1) THEN
+        load(x, hint); y.a := e; shift(0, x, y, hint, fse) (* shl x,y *)
+      ELSE (* imul reg32,r/m32,imm *)
+        loadMemReg(x, 4, hint);
+        IF x.mode IN {Reg, RegI} THEN
+          IF (y.a >= -128) & (y.a < 128) THEN Gen3v(6BH, x.r, x); GenByte(y.a)
+          ELSE Gen3v(69H, x.r, x); GenWord(y.a)
+          END;
+          x.mode := Reg
+        ELSE (* imul reg32,mem,imm *)
+          reg := GetReg(hint);
+          IF (y.a >= -128) & (y.a < 128) THEN Gen3v(6BH, reg, x); GenByte(y.a)
+          ELSE Gen3v(69H, reg, x); GenWord(y.a)
+          END;
+          x.mode := Reg; x.r := reg
+        END
+      END
+    ELSE (* imul reg32,r/m32 *)
+      load(x, hint); loadMemReg(y, 4, hint);
+      Gen3v(0FAFH, x.r, y);
+      FreeItem(y)
+    END
+  END mul;
+
+  PROCEDURE sop(op: INTEGER; VAR x, y: Item; hint: SET);
+    VAR xset, yset: SET; yint: INTEGER; temp: Item;
+  BEGIN
+    IF (x.mode = ORB.Const) & (y.mode = ORB.Const) THEN
+      xset := SYSTEM.VAL(SET, x.a); yset := SYSTEM.VAL(SET, y.a);
+      IF op = ORS.plus THEN xset := xset + yset
+      ELSIF op = ORS.minus THEN xset := xset - yset
+      ELSIF op = ORS.times THEN xset := xset * yset
+      ELSE (*op = ORS.rdiv*) xset := xset / yset
+      END;
+      x.a := SYSTEM.VAL(INTEGER, xset)
+    ELSIF (x.mode = ORB.Const) OR (y.mode = ORB.Const) THEN
+      IF x.mode = ORB.Const THEN
+        load(y, hint); yint := x.a;
+        IF op = ORS.minus THEN Gen2(0F7H, 2, y.r); op := ORS.times END; (* neg y *)
+        temp := x; x := y; y := temp
+      ELSE (*y.mode = ORB.Const*)
+        load(x, hint);
+        IF op = ORS.minus THEN op := ORS.times; yint := -y.a-1 ELSE yint := y.a END
+      END;
+      IF (y.a >= -128) & (y.a <= 127) THEN
+        IF op = ORS.plus THEN op := 1
+        ELSIF op = ORS.times THEN op := 4
+        ELSE (*op = ORB.rdiv*) op := 6
+        END;
+        Gen2(83H, op, x.r); GenByte(yint)
+      ELSIF x.r = AX THEN
+        IF op = ORS.plus THEN op := 0DH
+        ELSIF op = ORS.times THEN op := 25H
+        ELSE (*op = ORB.rdiv*) op := 35H
+        END;
+        Gen1(op); GenWord(yint)
+      ELSE
+        IF op = ORS.plus THEN op := 1
+        ELSIF op = ORS.times THEN op := 4
+        ELSE (*op = ORB.rdiv*) op := 6
+        END;
+        Gen2(81H, op, x.r); GenWord(yint)
+      END
+    ELSIF op = ORS.minus THEN
+      load(x, hint); load(y, regs); Gen2(0F7H, 2, y.r); Gen2(23H, x.r, y.r); FreeReg(y.r) (* not y; and x,y *)
+    ELSE
+      load(x, hint); loadMemReg(y, 4, regs);
+      IF op = ORS.plus THEN Gen3v(0BH, x.r, y) (* or x,y *)
+      ELSIF op = ORS.times THEN Gen3v(23H, x.r, y) (* and x,y *)
+      ELSE (*op = ORS.rdiv*) Gen3v(33H, x.r, y) (* xor x,y *)
+      END;
+      FreeItem(y)
+    END
+  END sop;
+
+  (* Code generation for Selectors, Variables, Constants *)
+
+  PROCEDURE Field*(VAR x: Item; y: ORB.Object);   (* x := x.y *)
+  BEGIN;
+    IF x.mode = ORB.Var THEN
+      IF x.r >= 0 THEN x.a := x.a + y.val
+      ELSE loadAdr(x, regs); x.mode := RegI; x.a := y.val
+      END
+    ELSIF x.mode = RegI THEN x.a := x.a + y.val
+    ELSIF x.mode = ORB.Par THEN x.b := x.b + y.val
+    END
+  END Field;
+
+  PROCEDURE Index*(VAR x, y: Item);   (* x := x[y] *)
+    VAR s, lim, L: LONGINT; z: Item;
+  BEGIN s := x.type.base.size; lim := x.type.len;
+    IF (y.mode = ORB.Const) & (lim >= 0) THEN
+      IF (y.a < 0) OR (y.a >= lim) THEN ORS.Mark("bad index") END ;
+      IF x.mode IN {ORB.Var, RegI} THEN x.a := y.a * s + x.a
+      ELSIF x.mode = ORB.Par THEN x.b := y.a * s + x.b
+      END
+    ELSE load(y, regs);
+      IF check THEN  (*check array bounds*)
+        IF lim >= 0 THEN cmpcon(y, lim)
+        ELSE (*open array*)
+          IF x.mode IN {ORB.Var, ORB.Par} THEN
+            z.mode := Reg; z.type := ORB.intType; z.r := GetReg(regs);
+            Gen3(8BH, z.r, BP, x.a + TagOff, anyoffset); cmp(y, z);
+            FreeReg(z.r)
+          ELSE ORS.Mark("error in Index")
+          END
+        END ;
+        Trap(ccAE, 1)
+      END ;
+      IF s # 1 THEN MakeConstItem(z, ORB.intType, s); mul(y, z, regs, FALSE) END ;
+      loadAdr(x, regs); addop(ORS.plus, x, y, regs, FALSE);
+      x.mode := RegI; x.a := 0
+    END
+  END Index;
+
+  PROCEDURE DeRef*(VAR x: Item);
+  BEGIN
+    IF x.mode IN {ORB.Var, ORB.Par, RegI} THEN
+      load(x, regs); IF check THEN cmpcon(x, 0); Trap(ccE, 4) END
+    ELSIF x.mode # Reg THEN ORS.Mark("bad mode in DeRef")
+    END ;
+    x.mode := RegI; x.a := 0; x.b := 0
+  END DeRef;
+
+  PROCEDURE Q(T: ORB.Type; VAR dcw: LONGINT);
+  BEGIN (*one entry of type descriptor extension table*)
+    IF T.base # NIL THEN
+      Q(T.base, dcw); data[dcw] := (T.mno*1000H + T.len) * 1000H + dcw - fixorgT;
+      fixorgT := dcw; INC(dcw)
+    END
+  END Q;
+
+  PROCEDURE FindPtrFlds(typ: ORB.Type; off: LONGINT; VAR dcw: LONGINT);
+    VAR fld: ORB.Object; i, s: LONGINT;
+  BEGIN
+    IF (typ.form = ORB.Pointer) OR (typ.form = ORB.NilTyp) THEN data[dcw] := off; INC(dcw)
+    ELSIF typ.form = ORB.Record THEN
+      fld := typ.dsc;
+      WHILE fld # NIL DO FindPtrFlds(fld.type, fld.val + off, dcw); fld := fld.next END
+    ELSIF typ.form = ORB.Array THEN
+      s := typ.base.size;
+      FOR i := 0 TO typ.len-1 DO FindPtrFlds(typ.base, i*s + off, dcw) END
+    END
+  END FindPtrFlds;
+
+  PROCEDURE BuildTD*(T: ORB.Type; VAR dc: LONGINT);
+    VAR dcw, k, s: LONGINT;  (*dcw = word address*)
+  BEGIN dcw := dc DIV 4; s := T.size; (*convert size for heap allocation*)
+    IF s <= 24 THEN s := 32 ELSIF s <= 56 THEN s := 64 ELSIF s <= 120 THEN s := 128
+    ELSE s := (s+263) DIV 256 * 256
+    END ;
+    T.len := dc; data[dcw] := s; INC(dcw);  (*len used as address*)
+    k := T.nofpar;   (*extension level!*)
+    IF k > 3 THEN ORS.Mark("ext level too large")
+    ELSE Q(T, dcw);
+      WHILE k < 3 DO data[dcw] := -1; INC(dcw); INC(k) END
+    END ;
+    FindPtrFlds(T, 0, dcw); data[dcw] := -1; INC(dcw); tdx := dcw; dc := dcw*4;
+    IF tdx >= maxTD THEN ORS.Mark("too many record types"); tdx := 0 END
+  END BuildTD;
+
+  PROCEDURE TypeTest*(VAR x: Item; T: ORB.Type; varpar, isguard: BOOLEAN);
+    VAR pc0, r: LONGINT; y: Item;
+  BEGIN
+    IF T = NIL THEN
+      FreeItem(x);
+      SetCC(x, ccTrue)
+    ELSE (*fetch tag into RH*)
+      r := GetReg(regs);
+      IF varpar THEN Gen3(8BH, r, BP, x.a + TagOff, anyoffset) (*mov r,[ebp+TagOff]*)
+      ELSE load(x, regs);
+        cmpcon(x, 0); Gen1(JccD8 + ccE); pc0 := pc; GenByte(0);  (*NIL belongs to every pointer type*)
+        Gen3(8BH, r, x.r, -8, anyoffset) (*mov r,[x-8]*)
+      END ;
+      Gen3(8BH, r, r, T.nofpar*4, anyoffset); (*mov r,[r+extlev*4]*)
+      loadTypTagAdr(y, T, regs);
+      Gen2(3BH, r, y.r); FreeReg(r); FreeReg(y.r); (*cmp r,y*)
+      IF ~varpar THEN PutByte(pc0, pc - (pc0 + 1)) END;
+      IF isguard THEN
+        IF check THEN Trap(ccNE, 2) END
+      ELSE
+        IF ~varpar THEN FreeReg(x.r) END;
+        SetCC(x, ccE)
+      END
+    END
+  END TypeTest;
+
+  (* Code generation for Boolean operators *)
+
+  PROCEDURE Not*(VAR x: Item);   (* x := ~x *)
+    VAR t: LONGINT;
+  BEGIN
+    IF x.mode # Cond THEN loadCond(x) END ;
+    x.r := negated(x.r); t := x.a; x.a := x.b; x.b := t
+  END Not;
+
+  PROCEDURE And1*(VAR x: Item);   (* x := x & *)
+    VAR cond: INTEGER;
+  BEGIN
+    IF x.mode # Cond THEN loadCond(x) END ;
+    cond := negated(x.r);
+    IF cond # ccTrue THEN
+      IF cond = ccFalse THEN Gen1(JmpD32); GenWord(x.a); x.a := pc - 4 (* jmp rel32 *)
+      ELSIF cond IN {0..15} THEN Gen1(JccD32 + cond); GenWord(x.a); x.a := pc - 4 (* jcc rel32 *)
+      ELSE ORS.Mark("invalid cc")
+      END
+    END;
+    FixLink(x.b); x.b := 0
+  END And1;
+
+  PROCEDURE And2*(VAR x, y: Item);
+  BEGIN
+    IF y.mode # Cond THEN loadCond(y) END ;
+    x.a := merged(y.a, x.a); x.b := y.b; x.r := y.r
+  END And2;
+
+  PROCEDURE Or1*(VAR x: Item);   (* x := x OR *)
+    VAR cond: INTEGER;
+  BEGIN
+    IF x.mode # Cond THEN loadCond(x) END ;
+    cond := x.r;
+    IF cond # ccFalse THEN
+      IF cond = ccTrue THEN Gen1(JmpD32); GenWord(x.b); x.b := pc - 4 (* jmp rel32 *)
+      ELSIF cond IN {0..15} THEN Gen1(JccD32 + cond); GenWord(x.b); x.b := pc - 4 (* jcc rel32 *)
+      ELSE ORS.Mark("invalid cc")
+      END
+    END;
+    FixLink(x.a); x.a := 0
+  END Or1;
+
+  PROCEDURE Or2*(VAR x, y: Item);
+  BEGIN
+    IF y.mode # Cond THEN loadCond(y) END ;
+    x.a := y.a; x.b := merged(y.b, x.b); x.r := y.r
+  END Or2;
+
+  (* Code generation for arithmetic operators *)
+
+  PROCEDURE Neg*(VAR x: Item);   (* x := -x *)
+  BEGIN
+    IF x.type.form = ORB.Int THEN
+      IF x.mode = ORB.Const THEN x.a := -x.a
+      ELSE load(x, regs); Gen2(0F7H, 3, x.r) (*neg x*)
+      END
+    ELSIF x.type.form = ORB.Real THEN
+      IF x.mode = ORB.Const THEN x.a := x.a + 7FFFFFFFH + 1
+      ELSIF x.mode IN {ORB.Var, ORB.Par, RegI} THEN
+        Gen1(0D9EEH); incF; (*fldz*) Gen3v(0D8H, 4, x); FreeItem(x); x.mode := FStk (*fsub m32fp*)
+      ELSE loadFloat(x); Gen1(0D9EEH); incF; Gen1(0DEE1H); decF (*x; fldz; fsubrp*)
+      END
+    ELSE (*form = Set*)
+      IF x.mode = ORB.Const THEN x.a := -x.a-1 
+      ELSE load(x, regs); Gen2(0F7H, 2, x.r) (*not x*)
+      END
+    END
+  END Neg;
+
+  PROCEDURE AddOp*(op: LONGINT; VAR x, y: Item);   (* x := x +- y *)
+  BEGIN addop(op, x, y, regs, TRUE)
+  END AddOp;
+
+  PROCEDURE MulOp*(VAR x, y: Item);   (* x := x * y *)
+  BEGIN mul(x, y, regs, TRUE)
+  END MulOp;
+
+  PROCEDURE DivOp*(op: LONGINT; VAR x, y: Item);   (* x := x op y *)
+    VAR e, r: LONGINT; positive, popax, popdx: BOOLEAN;
+  BEGIN
+    positive := (x.mode = ORB.Const) & (x.a >= 0);
+    IF (y.mode = ORB.Const) & (y.a <= 0) THEN
+      IF op = ORS.div THEN ORS.Mark("bad divisor") ELSE ORS.Mark("bad modulus") END
+    ELSIF (x.mode = ORB.Const) & (y.mode = ORB.Const) THEN
+      IF op = ORS.div THEN x.a := x.a DIV y.a ELSE x.a := x.a MOD y.a END
+    ELSIF (y.mode = ORB.Const) & (y.a >= 2) & (log2(y.a, e) = 1) THEN
+      IF op = ORS.div THEN y.a := e; shift(1, x, y, regs, TRUE) (* sar x,y *)
+      ELSIF e <= 16 THEN y.a := y.a-1; sop(ORS.times, x, y, regs) (* and x,(y-1) *)
+      ELSE
+        MakeConstItem(y, ORB.intType, 32 - e); shift(0, x, y, regs, FALSE); (* shl x,y *)
+        MakeConstItem(y, ORB.intType, 32 - e); shift(2, x, y, regs, TRUE); (* ror x,y *)
+      END
+    ELSIF ~check & positive & (y.mode IN {ORB.Var, ORB.Par, RegI}) THEN
+      IF (y.mode = RegI) & ((y.r = AX) OR (y.r = DX)) THEN
+        r := GetReg(regs - {AX, DX});
+        IF r IN {AX, DX} THEN ORS.Mark("too many regs in use") END;
+        y.mode := Reg; mov(r, y); FreeReg(y.r); y.mode := RegI; y.r := r
+      END;
+      load(x, {AX}); popax := FALSE; popdx := FALSE;
+      IF x.r # AX THEN Gen1(50H + AX); popax := TRUE; mov(AX, x); x.r := AX END;
+      IF DX IN usedRegs THEN Gen1(50H + DX); popdx := TRUE END;
+      INCL(usedRegs, DX);
+      Gen3v(99F7H, 7, y); (* cdq; idiv y *)
+      IF op = ORS.div THEN
+        x.r := AX;
+        IF popax THEN
+          IF popdx THEN r := GetReg(regs); mov(r, x); FreeReg(AX); FreeReg(DX); x.r := r
+          ELSE mov(DX, x); x.r := DX; FreeReg(AX)
+          END
+        ELSE FreeReg(DX)
+        END
+      ELSE
+        x.r := DX;
+        IF popdx THEN
+          IF popax THEN r := GetReg(regs); mov(r, x); x.r := r; FreeReg(AX); FreeReg(DX)
+          ELSE mov(AX, x); x.r := AX; FreeReg(DX)
+          END
+        ELSE FreeReg(AX)
+        END
+      END;
+      FreeItem(y);
+      IF popdx THEN Gen1(58H + DX); INCL(usedRegs, DX) END;
+      IF popax THEN Gen1(58H + AX); INCL(usedRegs, AX) END
+    ELSE
+      load(x, {AX}); load(y, regs - {AX, DX});
+      (* set registers *)
+      popax := FALSE; popdx := FALSE;
+      IF (x.r # DX) & (y.r = AX) THEN xchg(x.r, y.r); r := x.r; x.r := y.r; y.r := r
+      ELSE
+        IF x.r # AX THEN
+          IF AX IN usedRegs THEN Gen1(50H + AX); popax := TRUE END;
+          Gen2(08BH, AX, x.r); FreeReg(x.r); x.r := AX; INCL(usedRegs, AX)
+        END;
+        IF y.r = DX THEN
+          r := GetReg(regs - {AX}); Gen2(08BH, r, DX); FreeReg(DX); y.r := r
+        END;
+      END;
+      IF DX IN usedRegs THEN Gen1(50H + DX); popdx := TRUE END; INCL(usedRegs, DX); (* prevent allocation *)
+      (* division *)
+      IF check THEN cmpcon(y, 0); Trap(ccLE, 6) END;
+      IF positive THEN
+        Gen2(99F7H, 7, y.r); (* cdq; idiv y *)
+        IF op = ORS.div THEN
+          x.r := AX;
+          IF popax THEN
+            IF popdx THEN mov(y.r, x); FreeReg(AX); FreeReg(DX); x.r := y.r
+            ELSE mov(DX, x); FreeReg(AX); FreeReg(y.r); x.r := DX
+            END
+          ELSE FreeReg(DX); FreeReg(y.r)
+          END
+        ELSE
+          x.r := DX;
+          IF popdx THEN
+            IF popax THEN mov(y.r, x); FreeReg(AX); FreeReg(DX); x.r := y.r
+            ELSE mov(AX, x); FreeReg(DX); FreeReg(y.r); x.r := AX
+            END
+          ELSE FreeReg(AX); FreeReg(y.r)
+          END
+        END
+      ELSE
+        r := GetReg(regs - {AX, DX});
+        Gen2(8BH, r, AX); (* mov r,eax *)
+        Gen2(0C1H, 7, r); GenByte(31); (* sar r,31 *)
+        Gen2(33H, AX, r); (* xor eax,r *)
+        Gen2(99F7H, 7, y.r); (* cdq; idiv y *)
+        IF op = ORS.div THEN
+          FreeReg(y.r); FreeReg(DX);
+          IF popax THEN Gen2(33H, r, AX); FreeReg(AX); x.r := r (* xor r, eax *)
+          ELSE Gen2(33H, AX, r); FreeReg(r); x.r := AX (* xor eax,r *)
+          END
+        ELSE (* op = ORS.mod *)
+          FreeReg(AX);
+          Gen2(23H, y.r, r); (* and y,r *)
+          Gen2(33H, DX, r); (* xor edx,r *)
+          FreeReg(r);
+          IF popdx THEN x.r := y.r; y.r := DX ELSE x.r := DX END;
+          AddOp(ORS.plus, x, y)
+        END
+      END;
+      (* restore registers *)
+      IF popdx THEN Gen1(58H + DX); INCL(usedRegs, DX) END;
+      IF popax THEN Gen1(58H + AX); INCL(usedRegs, AX) END
+    END
+  END DivOp;
+
+  (* Code generation for REAL operators *)
+
+  PROCEDURE RealOp*(op: INTEGER; VAR x, y: Item);   (* x := x op y *)
+    VAR sizeop: INTEGER; temp: Item;
+  BEGIN
+    IF (op = ORS.minus) OR (op = ORS.rdiv) THEN
+      IF y.mode IN {ORB.Const, ORB.Var, ORB.Par, RegI} THEN
+        loadFloat(x);
+        IF y.mode = ORB.Const THEN MakeConstVarItem(y, y.type, y.a) END;
+        IF y.type.form = ORB.Real THEN sizeop := 0D8H ELSE sizeop := 0DAH END; (*m32fp/m32int*)
+        IF op = ORS.minus THEN op := 4 ELSE op := 6 END; (*fsub/fdiv*)
+        Gen3v(sizeop, op, y);
+        FreeItem(y)
+      ELSIF x.mode IN {ORB.Const, ORB.Var, ORB.Par, RegI} THEN
+        loadFloat(y);
+        IF x.mode = ORB.Const THEN MakeConstVarItem(x, x.type, x.a) END;
+        IF x.type.form = ORB.Real THEN sizeop := 0D8H ELSE sizeop := 0DAH END; (*m32fp/m32int*)
+        IF op = ORS.minus THEN op := 5 ELSE op := 7 END; (*fsubr/fdivr*)
+        Gen3v(sizeop, op, x);
+        FreeItem(x)
+      ELSE
+        IF (x.mode # FStk) & (y.mode = FStk) THEN
+          IF op = ORS.minus THEN op := 0DEE1H ELSE op := 0DEF1H END (*fsubrp/fdivrp*)
+        ELSE
+          IF op = ORS.minus THEN op := 0DEE9H ELSE op := 0DEF9H END (*fsubp/fdivp*)
+        END;
+        loadFloat(x); loadFloat(y); Gen1(op); decF
+      END
+    ELSIF op = ORS.plus THEN
+      IF y.mode IN  {ORB.Const, ORB.Var, ORB.Par, RegI} THEN
+        loadFloat(x);
+        IF y.mode = ORB.Const THEN MakeConstVarItem(y, y.type, y.a) END;
+        IF y.type.form = ORB.Real THEN sizeop := 0D8H ELSE sizeop := 0DAH END; (*m32fp/m32int*)
+        Gen3v(sizeop, 0, y); (*fadd*)
+        FreeItem(y)
+      ELSE
+        IF (x.mode # FStk) & (y.mode = FStk) THEN loadFloat(x); Gen1(0D9C9H) (*fxch*)
+        ELSE loadFloat(x); loadFloat(y);
+        END;
+        Gen1(0DEC1H); decF (*faddp*)
+      END
+    ELSE (*op = ORS.times*)
+      IF (x.mode # FStk) & (y.mode = FStk) THEN temp := x; x := y; y := temp END;
+      loadFloat(x);
+      IF y.mode IN {ORB.Const, ORB.Var, ORB.Par, RegI} THEN
+        IF y.mode = ORB.Const THEN MakeConstVarItem(y, y.type, y.a) END;
+        IF y.type.form = ORB.Real THEN sizeop := 0D8H ELSE sizeop := 0DAH END;
+        Gen3v(sizeop, 1, y); (*fmul*)
+        FreeItem(y)
+      ELSE loadFloat(y); Gen1(0DEC9H); decF (*fmulp*)
+      END
+    END ;
+    x.mode := FStk; x.type := ORB.realType
+  END RealOp;
+
+  (* Code generation for set operators *)
+
+  PROCEDURE Singleton*(VAR x: Item);  (* x := {x} *)
+    VAR y: Item;
+  BEGIN
+    IF x.mode = ORB.Const THEN x.a := LSL(1, x.a) 
+    ELSE MakeConstItem(y, x.type, 1); shift(0, y, x, regs, FALSE); x := y (*shl y,x*)
+    END
+  END Singleton;
+
+  PROCEDURE Set*(VAR x, y: Item);   (* x := {x .. y} *)
+    VAR z: Item;
+  BEGIN
+    IF (x.mode = ORB.Const) & ( y.mode = ORB.Const) THEN
+      IF x.a <= y.a THEN x.a := LSL(2, y.a) - LSL(1, x.a) ELSE x.a := 0 END
+    ELSE
+      IF x.mode = ORB.Const THEN x.a := LSL(-1, x.a)
+      ELSE MakeConstItem(z, x.type, -1); shift(0, z, x, regs - {CX}, FALSE); x := z (* shl *)
+      END ;
+      IF y.mode = ORB.Const THEN y.a := LSL(-2, y.a)
+      ELSE MakeConstItem(z, y.type, -2); shift(0, z, y, regs, FALSE); y := z (* shl *)
+      END ;
+      IF (x.mode # ORB.Const) OR (x.a # 0) THEN
+        sop(ORS.minus, x, y, regs)
+      END
+    END
+  END Set;
+
+  PROCEDURE In*(VAR x, y: Item);  (* x := x IN y *)
+  BEGIN load(y, regs);
+    IF x.mode = ORB.Const THEN Gen2(0FBAH, 4, y.r); GenByte(x.a); FreeReg(y.r) (*bt y,x*)
+    ELSE load(x, regs); Gen2(0FA3H, x.r, y.r); FreeReg(x.r); FreeReg(y.r) (*bt y,x*)
+    END;
+    SetCC(x, ccB)
+  END In;
+
+  PROCEDURE SetOp*(op: LONGINT; VAR x, y: Item);   (* x := x op y *)
+  BEGIN sop(op, x, y, regs)
+  END SetOp;
+
+  (* Code generation for relations *)
+
+  PROCEDURE Compare(VAR x, y: Item; VAR op: INTEGER; xhint, yhint: SET);
+    VAR size: INTEGER; temp: Item; rev: BOOLEAN; hint: SET;
+  BEGIN rev := FALSE;
+    IF (x.mode = ORB.Const) OR (x.mode = Reg) & (y.mode IN {ORB.Var, ORB.Par, RegI}) THEN
+      temp := x; x := y; y := temp; op := reverse(op); rev := TRUE;
+    END;
+    IF y.mode = ORB.Const THEN
+      IF (y.a >= -128) & (y.a <= 127) THEN size := 1; xhint := xhint - {SP..DI} ELSE size := 4 END;
+      loadMemReg(x, size, xhint)
+    ELSE
+      IF x.type.size >= y.type.size THEN
+        size := x.type.size; xhint := xhint - {SP..DI}; yhint := yhint - {SP..DI}
+      ELSE size := y.type.size
+      END;
+      loadMemReg(x, size, xhint); load(y, yhint)
+    END;
+    cmp(x, y);
+    IF rev THEN temp := x; x := y; y := temp END
+  END Compare;
+
+  PROCEDURE IntRelation*(op: INTEGER; VAR x, y: Item);   (* x := x < y *)
+  BEGIN
+    IF (x.mode = Cond) OR (y.mode = Cond) THEN ORS.Mark("not implemented")
+    ELSE Compare(x, y, op, regs, regs); FreeItem(x); FreeItem(y)
+    END;
+    SetCC(x, relmap[op - ORS.eql])
+  END IntRelation;
+
+  PROCEDURE RealRelation*(op: INTEGER; VAR x, y: Item);   (* x := x < y *)
+    VAR r, formop: INTEGER; used: BOOLEAN; temp: Item;
+  BEGIN used := AX IN usedRegs;
+    IF (x.mode = FStk) & (y.mode = FStk) OR (x.mode # FStk) & (y.mode = FStk) THEN
+      temp := x; x := y; y := temp; op := reverse(op)
+    END;
+    IF used THEN r := GetReg(regs - {AX}); Gen2(8BH, r, AX) END;
+    IF y.mode IN {ORB.Const, ORB.Var, ORB.Par, RegI} THEN
+      loadFloat(x);
+      IF y.mode = ORB.Const THEN MakeConstVarItem(y, y.type, y.a) END;
+      IF y.type.form = ORB.Real THEN formop := 0D8H ELSE formop := 0DAH END; (*m32fp/m32int*)
+      Gen3v(formop, 3, y); decF; (*fcomp*)
+      FreeItem(y)
+    ELSE loadFloat(x); loadFloat(y); Gen1(0DED9H); decF; decF; (*fcompp*)
+    END;
+    Gen1(0DFE09EH); (*fstsw ax; sahf*)
+    IF used THEN Gen2(8BH, AX, r); FreeReg(r) END;
+    SetCC(x, frelmap[op - ORS.eql])
+  END RealRelation;
+
+  PROCEDURE StringRelation*(op: INTEGER; VAR x, y: Item);   (* x := x < y *)
+    (*x, y are char arrays or strings*)
+    VAR a, b: Item; L0, L1: INTEGER;
+  BEGIN
+    a.mode := Reg; a.type := ORB.charType; a.r := GetReg({AX});
+    b.mode := Reg; b.type := ORB.charType; b.r := GetReg({BX,CX,DX});
+    IF x.type.form = ORB.String THEN loadStringAdr(x, regs) ELSE loadAdr(x, regs) END;
+    IF y.type.form = ORB.String THEN loadStringAdr(y, regs) ELSE loadAdr(y, regs) END;
+    L0 := pc;
+    Gen3(0FB6H, a.r, x.r, 0, anyoffset); (*movzx a,[x]*)
+    Gen3(8DH, x.r, x.r, 1, anyoffset); (*lea x,[x+1]*)
+    Gen3(0FB6H, b.r, y.r, 0, anyoffset); (*movzx b,[y]*)
+    Gen3(8DH, y.r, y.r, 1, anyoffset); (*lea y,[y+1]*)
+    cmp(a, b); Gen1(JccD8 + ccNE); L1 := pc; GenByte(0);
+    cmpcon(a, 0); Gen1(JccD8 + ccNE); GenByte(L0 - (pc + 1));
+    PutByte(L1, pc - (L1 + 1));
+    FreeReg(y.r); FreeReg(x.r); FreeReg(b.r); FreeReg(a.r);
+    SetCC(x, relmap[op - ORS.eql])
+  END StringRelation;
+
+  (* Code generation of Assignments *)
+
+  PROCEDURE StrToChar*(VAR x: Item);
+  BEGIN x.type := ORB.charType; DEC(strx, 4); x.a := ORD(str[x.a])
+  END StrToChar;
+
+  PROCEDURE Store*(VAR x, y: Item); (* x := y *)
+    VAR op, r, vr, va: LONGINT;
+  BEGIN
+    IF (y.mode = ORB.Const) & ((y.type.form # ORB.Proc) OR (x.type.size = 4)) THEN
+      IF x.type.size = 1 THEN op := 0C6H ELSE op := 0C7H END;
+      Gen3v(op, 0, x); (* mov [x],imm *)
+      IF y.type.form = ORB.Proc THEN GenWordAdr(y, FALSE)
+      ELSIF x.type.size = 1 THEN GenByte(y.a)
+      ELSE GenWord(y.a)
+      END;
+      FreeItem(x)
+    ELSIF (y.mode = FStk) & (x.type.size = 4) THEN
+      IF x.type.form = ORB.Real THEN Gen3v(0D9H, 3, x) (* fstp float32[x] *)
+      ELSE Gen3v(0DBH, 3, x) (* fistp dword[x] *)
+      END;
+      decF; FreeItem(x)
+    ELSE load(y, {AX});
+      IF (x.type.size = 1) & (y.r IN {SP..DI}) THEN (* must be AL, BL, CL, DL *)
+        r := GetReg(regs - {SP..DI});
+        IF r IN {SP..DI} THEN ORS.Mark("too many regs in use") END;
+        mov(r, y); FreeReg(y.r); y.r := r
+      END;
+      IF (x.mode = ORB.Var) & (x.r <= 0) & (y.r = AX) THEN (* mov [x],eax *)
+        IF x.type.size = 1 THEN Gen1(0A2H) ELSE Gen1(0A3H) END; GenWordAdr(x, FALSE)
+      ELSIF x.type.size = 1 THEN Gen3v(88H, y.r, x) (* mov byte[x],y *)
+      ELSE Gen3v(89H, y.r, x) (* mov dword[x],y *)
+      END;
+      FreeItem(y); FreeItem(x)
+    END
+  END Store;
+
+  PROCEDURE StoreStruct*(VAR x, y: Item); (* x := y, frame = 0 *)
+    VAR s, pc0, saveCX, saveSI, saveDI, L, cond: LONGINT; z, c: Item;
+  BEGIN
+    IF y.type.size # 0 THEN
+      loadAdr(x, {DI}); loadAdr(y, {SI}); MakeConstItem(z, ORB.intType, 0);
+      IF (x.type.form = ORB.Array) &  (x.type.len > 0) THEN
+        IF y.type.len >= 0 THEN 
+          IF x.type.size = y.type.size THEN MakeConstItem(z, ORB.intType, (y.type.size+3) DIV 4)
+          ELSE ORS.Mark("different length/size, not implemented")
+          END
+        ELSE (*y open array*)
+          z.mode := Reg; z.type := ORB.intType; z.r := GetReg({CX});
+          Gen3(8BH, z.r, BP, y.a + TagOff, anyoffset); (*get length*)
+          s := y.type.base.size; (*element size*)
+          cmpcon(z, 0); Gen1(JccD8 + ccE); pc0 := pc; GenByte(0);
+          IF s = 1 THEN
+            Gen3(8DH, z.r, z.r, 3, anyoffset); (*lea z,[z+3]*)
+            MakeConstItem(c, z.type, 2); shift(1, z, c, {CX}, FALSE); (*sar*)
+          ELSIF s # 4 THEN
+            MakeConstItem(c, ORB.intType, s DIV 4); mul(z, c, {CX}, FALSE)
+          END ;
+          IF check THEN
+            cmpcon(z, (x.type.size + 3) DIV 4); Trap(ccG, 3)
+          END ;
+          PutByte(pc0, pc - (pc0 + 1))
+        END
+      ELSIF x.type.form = ORB.Record THEN MakeConstItem(z, ORB.intType, (y.type.size+3) DIV 4)
+      ELSE ORS.Mark("inadmissible assignment")
+      END ;
+      load(z, {CX});
+      IF x.r # DI THEN SaveReg(DI, {CX, SI, DI}, saveDI); mov(DI, x) END;
+      IF y.r # SI THEN SaveReg(SI, {CX, SI, DI}, saveSI); mov(SI, y) END;
+      IF z.r # CX THEN SaveReg(CX, {CX, SI, DI}, saveCX); mov(CX, z) END;
+      Gen1(0F3A5H); (*rep movsd*)
+      IF x.r # DI THEN RestoreReg(DI, saveDI) END;
+      IF y.r # SI THEN RestoreReg(SI, saveSI) END;
+      IF z.r # CX THEN RestoreReg(CX, saveCX) END;
+      FreeReg(z.r)
+    END ;
+    FreeItem(y); FreeItem(x)
+  END StoreStruct;
+
+  PROCEDURE CopyString*(VAR x, y: Item);  (* x := y *) 
+    VAR len, L, saveAX, saveSI, saveDI, reg, cond: LONGINT; z: Item;
+   BEGIN len := x.type.len;
+    IF len >= 0 THEN
+      IF len <  y.b THEN ORS.Mark("string too long") END
+    ELSIF check THEN
+      z.mode := RegI; z.type := ORB.intType; z.r := BP; z.a := x.a + TagOff;  (*open array len*)
+      cmpcon(z, y.b); Trap(ccL, 3)
+    END ;
+    loadAdr(x, {DI});
+    loadStringAdr(y, {SI});
+    (* move regs *)
+    saveDI := DI; saveSI := SI;
+    IF (x.r = SI) & (y.r = DI) THEN xchg(SI, DI)
+    ELSE
+      IF x.r # DI THEN SaveReg(DI, {AX, SI, DI}, saveDI); mov(DI, x); FreeReg(x.r) END;
+      IF y.r # SI THEN SaveReg(SI, {AX, SI, DI}, saveDI); mov(SI, y); FreeReg(y.r) END
+    END;
+    x.r := DI; y.r := SI;
+    SaveReg(AX, {AX, SI, DI}, saveAX);
+    (* strcpy *)
+    L := pc;
+    Gen1(0ACAAH); (*lodsb; stosb*)
+    Gen1(0A8FFH); (*test al,0xff*)
+    Gen1(JccD8 + ccNE); GenByte(L - (pc + 1)); (* jnz L *)
+    (* restore regs *)
+    RestoreReg(AX, saveAX);
+    RestoreReg(SI, saveSI);
+    RestoreReg(DI, saveDI)
+   END CopyString;
+  
+  (* Code generation for parameters *)
+  
+  PROCEDURE OpenArrayParam*(VAR x: Item);
+    VAR offset: INTEGER;
+  BEGIN loadAdr(x, regs); offset := x.a; push(x); (*push adr*)
+    IF x.type.len >= 0 THEN MakeConstItem(x, ORB.intType, x.type.len)
+    ELSE x.mode := RegI; x.type := ORB.intType; x.r := BP; x.a := offset + TagOff
+    END;
+    push(x) (*push len*)
+  END OpenArrayParam;
+
+  PROCEDURE VarParam*(VAR x: Item; ftype: ORB.Type);
+    VAR xmd, offset: INTEGER;
+  BEGIN xmd := x.mode; offset := x.a; loadAdr(x, regs); push(x); (*push adr*)
+    IF (ftype.form = ORB.Array) & (ftype.len < 0) THEN (*open array*)
+      IF x.type.len >= 0 THEN MakeConstItem(x, ORB.intType, x.type.len)
+      ELSE x.mode := RegI; x.type := ORB.intType; x.r := BP; x.a := offset + TagOff
+      END ;
+      push(x) (*push len*)
+    ELSIF ftype.form = ORB.Record THEN
+      IF xmd = ORB.Par THEN x.mode := RegI; x.type := ORB.intType; x.r := BP; x.a := offset + TagOff
+      ELSE loadTypTagAdr(x, x.type, regs)
+      END ;
+      push(x) (*push tag*)
+    END
+  END VarParam;
+
+  PROCEDURE ValueParam*(VAR x: Item);
+  BEGIN push(x)
+  END ValueParam;
+
+  PROCEDURE StringParam*(VAR x: Item);
+    VAR len: INTEGER;
+  BEGIN len := x.b;
+    loadStringAdr(x, regs); push(x); (*push adr*)
+    MakeConstItem(x, ORB.intType, len); push(x) (*push len*)
+  END StringParam;
+
+  (*For Statements*)
+
+  PROCEDURE For0*(VAR x, y: Item);
+  BEGIN load(y, regs)
+  END For0;
+
+  PROCEDURE For1*(VAR x, y, z, w: Item; VAR L: LONGINT);
+    VAR op: INTEGER;
+  BEGIN 
+    IF w.a > 0 THEN op := ORS.gtr
+    ELSIF w.a < 0 THEN op := ORS.lss
+    ELSE ORS.Mark("zero increment"); op := ORS.lss
+    END;
+    Compare(y, z, op, {AX}, regs); FreeItem(z);
+    Gen1(JccD32 + relmap[op - ORS.eql]); L := pc; GenWord(0);
+    Store(x, y)
+  END For1;
+
+  PROCEDURE For2*(VAR x, y, w: Item);
+  BEGIN addop(ORS.plus, x, w, regs, FALSE); FreeItem(x)
+  END For2;
+
+  (* Branches, procedure calls, procedure prolog and epilog *)
+
+  PROCEDURE AlignCode(a: INTEGER);
+    VAR len: INTEGER;
+  BEGIN
+    len := a - pc MOD a;
+    IF len # a THEN
+      WHILE len >= 2 DO GenShort(9066H); DEC(len, 2) END;
+      IF len = 1 THEN GenByte(90H) END
+    END
+  END AlignCode;
+
+  PROCEDURE Here*(): LONGINT;
+  BEGIN AlignCode(4); RETURN pc
+  END Here;
+
+  PROCEDURE FJump*(VAR L: LONGINT);
+  BEGIN Gen1(JmpD32); GenWord(L); L := pc - 4
+  END FJump;
+
+  PROCEDURE CFJump*(VAR x: Item);
+    VAR cond: INTEGER;
+  BEGIN
+    IF x.mode # Cond THEN loadCond(x) END;
+    cond := negated(x.r);
+    IF cond # ccFalse THEN
+      IF cond = ccTrue THEN Gen1(JmpD32); GenWord(x.a); x.a := pc - 4 (* jmp rel32 *)
+      ELSIF cond IN {0..15} THEN Gen1(JccD32 + cond); GenWord(x.a); x.a := pc - 4 (* jcc rel32 *)
+      ELSE ORS.Mark("invalid cc")
+      END
+    END;
+    FixLink(x.b)
+  END CFJump;
+
+  PROCEDURE BJump*(L: LONGINT);
+    VAR disp: INTEGER;
+  BEGIN disp := L - (pc + 2);
+    IF (disp >= -128) & (disp <= 127) THEN Gen1(JmpD8); GenByte(disp)
+    ELSE Gen1(JmpD32); GenWord(disp - 3)
+    END
+  END BJump;
+
+  PROCEDURE CBJump*(VAR x: Item; L: LONGINT);
+    VAR cond: INTEGER;
+  BEGIN
+    IF x.mode # Cond THEN loadCond(x) END;
+    cond := negated(x.r);
+    IF cond # ccFalse THEN
+      IF cond = ccTrue THEN Gen1(JmpD32); GenWord(L - (pc + 4)) (* jmp rel32 *)
+      ELSIF cond IN {0..15} THEN Gen1(JccD32 + cond); GenWord(L - (pc + 4)) (* jcc rel32 *)
+      ELSE ORS.Mark("invalid cc")
+      END
+    END;
+    FixLink(x.b); FixLinkWith(x.a, L)
+  END CBJump;
+
+  PROCEDURE Fixup*(VAR x: Item);
+  BEGIN FixLink(x.a)
+  END Fixup;
+
+  PROCEDURE SaveRegs(set: SET);
+    VAR i: INTEGER;
+  BEGIN
+    FOR i := AX TO DI DO
+      IF i IN set THEN Gen1(50H + i) END (*push*)
+    END;
+    usedRegs := usedRegs - set
+  END SaveRegs;
+
+  PROCEDURE RestoreRegs(set: SET);
+    VAR i: INTEGER;
+  BEGIN
+    FOR i := DI TO AX BY -1 DO
+      IF i IN set THEN Gen1(58H + i) END (*pop*)
+    END;
+    usedRegs := usedRegs + set
+  END RestoreRegs;
+
+  PROCEDURE PrepCall*(VAR x: Item; VAR r: LONGINT);
+    VAR set: SET; i: INTEGER;
+  BEGIN (*x.type.form = ORB.Proc*)
+    IF x.type.base.form # ORB.NoTyp THEN
+      IF x.mode > ORB.Par THEN load(x, {AX}); set := usedRegs - reservedRegs - {x.r}
+      ELSE set := usedRegs - reservedRegs
+      END;
+      SaveRegs(set); r := SYSTEM.VAL(INTEGER, set);
+      IF FH > 0 THEN (*save fpu regs*)
+        IF FH > 7 THEN ORS.Mark("fpu stack overflow") END;
+        i := 1; INC(FH); (*reserve one slot for result*)
+        Gen3(8DH, SP, SP, -FH*16, anyoffset); (* lea esp,[esp-imm] *)
+        WHILE i < FH DO Gen3(0DBH, 7, SP, i*16, anyoffset); INC(i) END; (* fstp float80[esp+i*16] *)
+        INC(r, FH*256); FH := 0
+      END
+    ELSE r := 0
+    END
+  END PrepCall;
+
+  PROCEDURE Call*(VAR x: Item; r: LONGINT);
+    VAR set: SET; i, reg, N, L, form: INTEGER; c: Item;
+  BEGIN (*x.type.form = ORB.Proc*)
+    set := SYSTEM.VAL(SET, r) * {AX..DI}; N := r DIV 256;
+    IF x.mode = ORB.Const THEN
+      IF x.r >= 0 THEN Gen1(0E8H); GenWord(x.a - (pc + 4)) (*call rel32*)
+      ELSE (*imported*)
+        Gen1(0E8H); GenWordAdr(x, TRUE) (*call rel32*)
+      END
+    ELSIF check THEN
+      load(x, {AX}); cmpcon(x, 0); Trap(ccE, 5); Gen2(0FFH, 2, x.r); FreeReg(x.r) (*call reg*)
+    ELSE
+      loadMemReg(x, 4, regs); Gen3v(0FFH, 2, x); FreeItem(x) (*call r/m32*)
+    END ;
+    form := x.type.base.form;
+    IF form # ORB.NoTyp THEN (*function*)
+      IF form # ORB.Real THEN
+        IF AX IN set THEN
+          reg := GetReg(regs - set);
+          IF reg IN set THEN ORS.Mark("register stack overflow") END;
+          Gen2(8BH, reg, AX) (* mov reg,eax *)
+        ELSE reg := AX
+        END;
+        INCL(usedRegs, reg);
+        x.mode := Reg; x.r := reg
+      ELSE
+        IF N > 0 THEN (*save fpu reg to make it top after restore, slot allocated in PrepCall *)
+          Gen3(0DBH, 7, SP, 0, anyoffset) (* fstp float80[esp] *)
+        ELSE FH := 1
+        END;
+        x.mode := FStk
+      END;
+      IF N > 0 THEN (*restore fpu regs*)
+        FH := N;
+        FOR i := N - 1 TO 0 BY -1 DO
+          Gen3(0DBH, 5, SP, i*16, anyoffset); (* fld float80[esp+i*16] *)
+        END;
+        Gen3(8DH, SP, SP, N*16, anyoffset); (* lea esp,[esp+imm] *)
+      END;
+      RestoreRegs(set)
+    END
+  END Call;
+
+  PROCEDURE Enter*(parblksize, locblksize: LONGINT; int: BOOLEAN);
+  BEGIN
+    procA := pc;
+    parblocksize := parblksize;
+    locblksize := -(locblksize+3) DIV 4 * 4;
+    Gen1(50H + BP); (*push ebp*)
+    Gen2(8BH, BP, SP); (*mov ebp,esp*)
+    IF locblksize # 0 THEN Gen3(8DH, SP, SP, locblksize, anyoffset) END; (*lea esp,[esp-4]*)
+    procB := pc
+  END Enter;
+
+  PROCEDURE Return*(form: INTEGER; VAR x: Item; size: LONGINT; int: BOOLEAN);
+  BEGIN
+    IF form # ORB.NoTyp THEN (*function*)
+      IF form = ORB.Real THEN loadFloat(x)
+      ELSE load(x, {AX}); IF x.r # AX THEN Gen2(8BH, AX, x.r) END (*mov eax,reg*)
+      END;
+      FreeItem(x)
+    END ;
+    IF pc # procB THEN (*procedure epilog*)
+      Gen2(8BH, SP, BP); (*mov esp,ebp*)
+      Gen1(58H + BP) (*pop ebp*)
+    ELSE pc := procA (*empty procedure, clear code*)
+    END ;
+    IF int THEN Gen1(0CFH) (*iret*)
+    ELSIF parblocksize # 0 THEN Gen1(0C2H); GenShort(parblocksize) (*ret size*)
+    ELSE Gen1(0C3H) (*ret*)
+    END ;
+    AlignCode(4)
+  END Return;
+
+  (* In-line code procedures*)
+
+  PROCEDURE Increment*(upordown: LONGINT; VAR x, y: Item);
+    VAR op: LONGINT; z: Item;
+  BEGIN
+    IF upordown = 0 THEN op := ORS.plus ELSE op := ORS.minus END;
+    IF y.type.form = ORB.NoTyp THEN MakeConstItem(y, x.type, 1) END;
+    IF x.mode > ORB.Par THEN
+      loadAdr(x, regs);
+      z.mode := RegI; z.type := x.type; z.r := GetReg(regs); z.a := 0; mov(z.r, x);
+      x.mode := RegI; x.a := 0
+    ELSE z := x
+    END;
+    AddOp(op, z, y); Store(x, z)
+  END Increment;
+
+  PROCEDURE Include*(inorex: LONGINT; VAR x, y: Item);
+    VAR op, reg: LONGINT; z: Item;
+  BEGIN
+    IF inorex = 0 THEN op := ORS.plus ELSE op := ORS.minus END;
+    IF x.mode > ORB.Par THEN
+      loadAdr(x, regs);
+      z.mode := RegI; z.type := x.type; z.r := GetReg(regs); z.a := 0; mov(z.r, x);
+      x.mode := RegI; x.a := 0
+    ELSE z := x
+    END;
+    Singleton(y); SetOp(op, z, y); Store(x, z)
+  END Include;
+
+  PROCEDURE Assert*(VAR x: Item);
+    VAR cond, op, pc0: LONGINT;
+  BEGIN
+    IF x.mode # Cond THEN loadCond(x) END ;
+    IF x.a = 0 THEN cond := negated(x.r)
+    ELSE
+      IF x.r # ccFalse THEN
+        IF x.r = ccTrue THEN Gen1(JmpD32) ELSE Gen1(JccD32 + x.r) END;
+        GenWord(x.b); x.b := pc - 4
+      END;
+      FixLink(x.a); cond := ccTrue
+    END ;
+    Trap(cond, 7); FixLink(x.b)
+  END Assert; 
+
+  PROCEDURE New*(VAR x: Item);
+  BEGIN loadAdr(x, regs); push(x); loadTypTagAdr(x, x.type.base, regs); push(x); Trap(ccTrue, 0)
+  END New;
+
+  PROCEDURE Pack*(VAR x, y: Item);
+    VAR z: Item;
+  BEGIN
+    IF x.mode > ORB.Par THEN
+      loadAdr(x, regs);
+      z.mode := RegI; z.type := x.type; z.r := GetReg(regs); z.a := 0; mov(z.r, x);
+      x.mode := RegI; x.a := 0
+    ELSE z := x
+    END;
+    IF y.mode # FStk THEN loadFloat(y); loadFloat(x); Gen1(0D9FDH) (*fscale*)
+    ELSE loadFloat(x); loadFloat(y); Gen1(0D9C9D9FDH) (*fxch; fscale*) 
+    END;
+    Store(z, x); Gen1(0DDD8H); decF (*fstp ST(0)*)
+  END Pack;
+
+  PROCEDURE Unpk*(VAR x, y: Item);
+    VAR z, e0: Item;
+  BEGIN
+    IF x.mode > ORB.Par THEN
+      loadAdr(x, regs);
+      z.mode := RegI; z.type := x.type; z.r := GetReg(regs); z.a := 0; mov(z.r, x);
+      x.mode := RegI; x.a := 0
+    ELSE z := x
+    END;
+    loadFloat(x); e0.mode := FStk; e0.type := ORB.realType;
+    Gen1(0D9F4H); incF; (*fxtract*)
+    Store(z, x); Store(y, e0)
+  END Unpk;
+
+  PROCEDURE Led*(VAR x: Item);
+    VAR y: Item;
+  BEGIN MakeConstItem(y, ORB.intType, 0); push(y); push(x); Trap(ccTrue, 255)
+  END Led;
+
+  PROCEDURE Get*(VAR x, y: Item);
+  BEGIN
+    IF y.mode = ORB.Const THEN ORS.Mark("var expected"); y.type := ORB.intType; y.mode := RegI; y.r := NoReg END;
+    IF x.mode = ORB.Const THEN x.type := y.type; x.mode := RegI; x.r := NoReg
+    ELSE load(x, regs); x.type := y.type; x.mode := RegI; x.a := 0
+    END;
+    Store(y, x)
+  END Get;
+
+  PROCEDURE Put*(VAR x, y: Item);
+  BEGIN
+    IF x.mode = ORB.Const THEN x.type := y.type; x.mode := RegI; x.r := NoReg
+    ELSE load(x, regs); x.type := y.type; x.mode := RegI; x.a := 0
+    END;
+    Store(x, y)
+  END Put;
+
+  PROCEDURE Copy*(VAR x, y, z: Item);
+    VAR saveCX, saveSI, saveDI, pc0, cond: INTEGER; w: Item;
+  BEGIN load(x, {DI}); load(y, {SI}); pc0 := 0;
+    IF z.mode = ORB.Const THEN
+      IF z.a <= 0 THEN ORS.Mark("bad count") END;
+      load(z, {CX})
+    ELSE load(z, {CX}); cmpcon(z, 0);
+      IF check THEN Trap(ccL, 3) END;
+      Gen1(JccD8 + ccE); pc0 := pc; GenByte(0)
+    END ;
+    IF x.r # DI THEN SaveReg(DI, {CX, SI, DI}, saveDI); mov(DI, x) END;
+    IF y.r # SI THEN SaveReg(SI, {CX, SI, DI}, saveSI); mov(SI, y) END;
+    IF z.r # CX THEN SaveReg(CX, {CX, SI, DI}, saveCX); mov(CX, z) END;
+    Gen1(0F3A5H); (*rep movsd*)
+    IF x.r # DI THEN RestoreReg(DI, saveDI) END;
+    IF y.r # SI THEN RestoreReg(SI, saveSI) END;
+    IF z.r # CX THEN RestoreReg(CX, saveCX) END;
+    FreeReg(z.r); FreeReg(y.r); FreeReg(x.r);
+    IF pc0 # 0 THEN PutByte(pc0, pc - (pc0 + 1)) END
+  END Copy;
+
+  PROCEDURE LDPSR*(VAR x: Item);
+  BEGIN (*x.mode = Const*)  Gen1(0FAH + x.a MOD 2) (*cli/sti*)
+  END LDPSR;
+
+  PROCEDURE LDREG*(VAR x, y: Item);
+  BEGIN mov(x.a MOD 8, y); FreeItem(y)
+  END LDREG;
+
+  (*In-line code functions*)
+
+  PROCEDURE Abs*(VAR x: Item);
+    VAR y: Item;
+  BEGIN
+    IF x.mode = ORB.Const THEN x.a := ABS(x.a)
+    ELSIF x.type.form = ORB.Real THEN loadFloat(x); Gen1(0D9E1H) (*fabs*)
+    ELSE
+      load(x, regs); y.mode := Reg; y.type := x.type; y.r := GetReg(regs);
+      Gen2(8BH, y.r, x.r); (*mov y,x*)
+      Gen2(0C0H, 7, y.r); GenByte(31); (*sar y,31*)
+      Gen2(33H, x.r, y.r); (*xor x,y*)
+      Gen2(2BH, x.r, y.r); (*sub x,y*)
+      FreeReg(y.r)
+    END
+  END Abs;
+
+  PROCEDURE Odd*(VAR x: Item);
+  BEGIN loadMemReg(x, 1, {AX});
+    IF (x.mode = Reg) & (x.r = AX) THEN Gen1(0A8H); GenByte(1) (*test al,1*)
+    ELSIF (x.mode = Reg) & (x.r IN {SP..DI}) THEN Gen2(0F7H, 0, x.r); GenWord(1) (*test r32,1*)
+    ELSE Gen3v(0F6H, 0, x); GenByte(1) (*test r/m8,1*)
+    END;
+    FreeItem(x);
+    SetCC(x, ccNE)
+  END Odd;
+
+  PROCEDURE Floor*(VAR x: Item);
+  BEGIN loadFloat(x); Gen1(0D9FCH) (*frndint*) 
+  END Floor;
+
+  PROCEDURE Float*(VAR x: Item);
+  BEGIN
+    IF x.mode = ORB.Const THEN x.a := SYSTEM.VAL(INTEGER, FLT(x.a))
+    ELSE loadFloat(x)
+    END
+  END Float;
+
+  PROCEDURE Ord*(VAR x: Item);
+  BEGIN loadMemReg(x, 4, regs)
+  END Ord;
+
+  PROCEDURE Len*(VAR x: Item);
+  BEGIN
+    IF x.type.len >= 0 THEN
+      FreeItem(x);
+      x.mode := ORB.Const; x.a := x.type.len
+    ELSE (*open array*) x.mode := Reg; x.r := GetReg(regs); Gen3(8BH, x.r, BP, x.a + TagOff, anyoffset)
+    END 
+  END Len;
+
+  PROCEDURE Shift*(fct: LONGINT; VAR x, y: Item);
+  BEGIN shift(fct, x, y, regs, TRUE)
+  END Shift;
+
+  PROCEDURE ADC*(VAR x, y: Item);
+  BEGIN
+    IF y.mode = ORB.Const THEN (*adc x,imm*)
+      load(x, {AX});
+      IF (y.a >= -128) & (y.a <= 127) THEN Gen2(83H, 2, x.r); GenByte(y.a)
+      ELSIF x.r = AX THEN Gen1(15H); GenWord(y.a)
+      ELSE Gen2(81H, 2, x.r); GenWord(y.a)
+      END
+    ELSE load(x, regs); loadMemReg(y, 4, regs); Gen3v(13H, x.r, y); FreeItem(y) (*adc x,y*)
+    END
+  END ADC;
+
+  PROCEDURE SBC*(VAR x, y: Item);
+  BEGIN
+    IF y.mode = ORB.Const THEN (*sbb x,imm*)
+      load(x, {AX});
+      IF (y.a >= -128) & (y.a <= 127) THEN Gen2(83H, 3, x.r); GenByte(y.a)
+      ELSIF x.r = AX THEN Gen1(1DH); GenWord(y.a)
+      ELSE Gen2(81H, 3, x.r); GenWord(y.a)
+      END
+    ELSE load(x, regs); loadMemReg(y, 4, regs); Gen3v(1BH, x.r, y); FreeItem(y) (*sbb x,y*)
+    END
+  END SBC;
+
+  PROCEDURE UML*(VAR x, y: Item);
+  BEGIN mul(x, y, regs, TRUE)
+  END UML;
+
+  PROCEDURE Bit*(VAR x, y: Item);
+  BEGIN
+    IF x.mode = ORB.Const THEN x.mode := RegI
+    ELSE load(x, regs); x.mode := RegI; x.a := 0
+    END;
+    IF y.mode = ORB.Const THEN Gen3v(0FBAH, 4, x); GenByte(y.a) (* bt dword[x],imm *)
+    ELSE load(y, regs); Gen3v(0FA3H, y.r, x); FreeReg(y.r) (* bt dword[x],y *)
+    END;
+    FreeItem(x);
+    SetCC(x, ccB)
+  END Bit;
+
+  PROCEDURE Register*(VAR x: Item);
+    VAR src, reg: INTEGER; used: BOOLEAN;
+  BEGIN (*x.mode = Const*)
+    src := x.a MOD 8; (*AX..DI*)
+    used := src IN usedRegs;
+    IF ~used THEN INCL(usedRegs, src) END;
+    reg := GetReg(regs); Gen2(8BH, reg, src); (*mov reg,src*)
+    IF ~used THEN FreeReg(src) END;
+    x.mode := Reg; x.r := reg
+  END Register;
+
+  PROCEDURE H*(VAR x: Item);
+    VAR reg: INTEGER; set: SET;
+  BEGIN (*x.mode = Const*)
+    IF ODD(x.a) THEN (*id*)
+      set := usedRegs - reservedRegs;
+      SaveRegs(set);
+      Gen3(8DH, SP, SP, -8, anyoffset); (*push a; pushb*)
+      Trap(ccTrue, 254); INCL(usedRegs, AX); x.mode := Reg; x.r := AX;
+      IF AX IN set THEN
+        reg := GetReg(regs - set);
+        IF reg IN set THEN ORS.Mark("too may regs in use") END;
+        mov(reg, x); x.r := reg; EXCL(usedRegs, AX)
+      END;
+      RestoreRegs(set)
+    ELSE ORS.Mark("remainder not available")
+    END
+  END H;
+
+  PROCEDURE Adr*(VAR x: Item);
+  BEGIN 
+    IF x.mode IN {ORB.Var, ORB.Par, RegI} THEN loadAdr(x, regs)
+    ELSIF (x.mode = ORB.Const) & (x.type.form = ORB.Proc) THEN loadMemReg(x, 4, regs)
+    ELSIF (x.mode = ORB.Const) & (x.type.form = ORB.String) THEN loadStringAdr(x, regs)
+    ELSE ORS.Mark("not addressable")
+    END
+  END Adr;
+
+  PROCEDURE Condition*(VAR x: Item);
+  BEGIN (*x.mode = Const*) SetCC(x, x.a)
+  END Condition;
+
+  PROCEDURE Open*(v: INTEGER);
+  BEGIN pc := 0; tdx := 0; strx := 0; usedRegs := reservedRegs; FH := 0; fixorgP := 0; fixorgD := 0; fixorgT := 0; check := v # 0; version := 10
+  END Open;
+
+  PROCEDURE SetDataSize*(dc: LONGINT);
+  BEGIN varsize := dc
+  END SetDataSize;
+
+  PROCEDURE Header*;
+  BEGIN entry := Here(); Enter(0, 0, FALSE)
+  END Header;
+
+  PROCEDURE NofPtrs(typ: ORB.Type): LONGINT;
+    VAR fld: ORB.Object; n: LONGINT;
+  BEGIN
+    IF (typ.form = ORB.Pointer) OR (typ.form = ORB.NilTyp) THEN n := 1
+    ELSIF typ.form = ORB.Record THEN
+      fld := typ.dsc; n := 0;
+      WHILE fld # NIL DO n := NofPtrs(fld.type) + n; fld := fld.next END
+    ELSIF typ.form = ORB.Array THEN n := NofPtrs(typ.base) * typ.len
+    ELSE n := 0
+    END ;
+    RETURN n
+  END NofPtrs;
+
+  PROCEDURE FindPtrs(VAR R: Files.Rider; typ: ORB.Type; adr: LONGINT);
+    VAR fld: ORB.Object; i, s: LONGINT;
+  BEGIN
+    IF (typ.form = ORB.Pointer) OR (typ.form = ORB.NilTyp) THEN Files.WriteInt(R, adr)
+    ELSIF typ.form = ORB.Record THEN
+      fld := typ.dsc;
+      WHILE fld # NIL DO FindPtrs(R, fld.type, fld.val + adr); fld := fld.next END
+    ELSIF typ.form = ORB.Array THEN
+      s := typ.base.size;
+      FOR i := 0 TO typ.len-1 DO FindPtrs(R, typ.base, i*s + adr) END
+    END
+  END FindPtrs;
+
+  PROCEDURE Close*(VAR modid: ORS.Ident; key, nofent: LONGINT);
+    VAR obj: ORB.Object;
+      i, comsize, nofimps, nofptrs, size, pad: LONGINT;
+      name: ORS.Ident;
+      F: Files.File; R: Files.Rider;
+      z: Item;
+  BEGIN  (*exit code*)
+    Return(ORB.NoTyp, z, 0, FALSE);
+    obj := ORB.topScope.next; nofimps := 0; comsize := 4; nofptrs := 0;
+    WHILE obj # NIL DO
+      IF (obj.class = ORB.Mod) & (obj.dsc # ORB.system) THEN INC(nofimps) (*count imports*)
+      ELSIF (obj.exno # 0) & (obj.class = ORB.Const) & (obj.type.form = ORB.Proc)
+          & (obj.type.nofpar = 0) & (obj.type.base = ORB.noType) THEN i := 0; (*count commands*)
+        WHILE obj.name[i] # 0X DO INC(i) END ;
+        i := (i+4) DIV 4 * 4; INC(comsize, i+4)
+      ELSIF obj.class = ORB.Var THEN INC(nofptrs, NofPtrs(obj.type))  (*count pointers*)
+      END ;
+      obj := obj.next
+    END ;
+    pad := (varsize + strx + CodeAlign - 1) DIV CodeAlign * CodeAlign - strx - varsize;
+    size := varsize + strx + pad + pc + comsize + (nofimps + nofent + nofptrs + 1)*4;  (*varsize includes type descriptors*)
+    ORB.MakeFileName(name, modid, ".int"); (*write code file*)
+    F := Files.New(name); Files.Set(R, F, 0); Files.WriteString(R, modid); Files.WriteInt(R, key); Files.Write(R, CHR(version));
+    Files.WriteInt(R, size);
+    obj := ORB.topScope.next;
+    WHILE (obj # NIL) & (obj.class = ORB.Mod) DO  (*imports*)
+      IF obj.dsc # ORB.system THEN Files.WriteString(R, obj(ORB.Module).orgname); Files.WriteInt(R, obj.val) END ;
+      obj := obj.next
+    END ;
+    Files.Write(R, 0X);
+    Files.WriteInt(R, tdx*4);
+    i := 0;
+    WHILE i < tdx DO Files.WriteInt(R, data[i]); INC(i) END ; (*type descriptors*)
+    Files.WriteInt(R, varsize - tdx*4);  (*data*)
+    Files.WriteInt(R, strx + pad);
+    FOR i := 0 TO strx-1 DO Files.Write(R, str[i]) END ;  (*strings*)
+    FOR i := 0 TO pad-1 DO Files.Write(R, 0X) END;  (*pad*)
+    Files.WriteInt(R, pc DIV 4);  (*code len*)
+    FOR i := 0 TO pc-1 DO Files.WriteByte(R, code[i]) END ;  (*program*)
+    obj := ORB.topScope.next;
+    WHILE obj # NIL DO  (*commands*)
+      IF (obj.exno # 0) & (obj.class = ORB.Const) & (obj.type.form = ORB.Proc) &
+          (obj.type.nofpar = 0) & (obj.type.base = ORB.noType) THEN
+        Files.WriteString(R, obj.name); Files.WriteInt(R, obj.val)
+      END ;
+      obj := obj.next
+    END ;
+    Files.Write(R, 0X);
+    Files.WriteInt(R, nofent); Files.WriteInt(R, entry);
+    obj := ORB.topScope.next;
+    WHILE obj # NIL DO  (*entries*)
+      IF obj.exno # 0 THEN
+        IF (obj.class = ORB.Const) & (obj.type.form = ORB.Proc) OR (obj.class = ORB.Var) THEN
+          Files.WriteInt(R, obj.val);
+        ELSIF obj.class = ORB.Typ THEN
+          IF obj.type.form = ORB.Record THEN Files.WriteInt(R,  obj.type.len MOD 10000H)
+          ELSIF (obj.type.form = ORB.Pointer) & ((obj.type.base.typobj = NIL) OR (obj.type.base.typobj.exno = 0)) THEN
+            Files.WriteInt(R,  obj.type.base.len MOD 10000H)
+          END
+        END
+      END ;
+      obj := obj.next
+    END ;
+    obj := ORB.topScope.next;
+    WHILE obj # NIL DO  (*pointer variables*)
+      IF obj.class = ORB.Var THEN FindPtrs(R, obj.type, obj.val) END ;
+      obj := obj.next
+    END ;
+    Files.WriteInt(R, -1);
+    Files.WriteInt(R, fixorgP); Files.WriteInt(R, fixorgD); Files.WriteInt(R, fixorgT); Files.WriteInt(R, entry);
+    Files.Write(R, "O"); Files.Register(F)
+  END Close;
+
+BEGIN relmap[0] := ccE; relmap[1] := ccNE; relmap[2] := ccL; relmap[3] := ccLE; relmap[4] := ccG; relmap[5] := ccGE;
+  frelmap[0] := ccE; frelmap[1] := ccNE; frelmap[2] := ccB; frelmap[3] := ccBE; frelmap[4] := ccA; frelmap[5] := ccAE
+END ORG.

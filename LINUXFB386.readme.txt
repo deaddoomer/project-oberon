@@ -1,0 +1,66 @@
+Revised Oberon for Linux/386
+
+System requirements:
+- Linux kernel 3.11 or newer
+- Processor Intel 386 or compatible, FPU 387 or emulator
+- File system compatible with O_TMPFILE
+- Procfs mounted at /proc
+- Keyboard device /dev/event/event* and read access to it
+- Mouse device /dev/psaux or /dev/event/mice and read access to it
+- Framebuffer device /dev/fb0 with 32 bits per pixel mode and read-write access to it
+
+Boot the System:
+0. Save and backup all important data before use Oberon ;)
+1. Switch to virtual console (typically can be done via Ctrl+Alt+Fx)
+2. Set current work directory to root of the Oberon System
+3. Run `oberon` executable
+4. Use command Host.Exit to shutdown Oberon System and return to Linux
+
+Bugs:
+- Oberon doesn't leave graphics mode on crash, so you machine might be locked.
+  In such case press Alt+SysRq+r to unlock console.
+  Command `chvt` can be used too when you have remote access to this machine.
+- Oberon currently doesn't implement any kind of interrupt key.
+  Use Alt+SysRq+k when you fall into infinity loop. This will kill Oberon process and unlock virtual console.
+- Like Oberon for RISC, this version didn't provide stack overflow protection. Do not run infinity recusion :)
+- Long running system may work unstable after 32-bit timer overflow
+
+Platform specific issues:
+- Kernel increases heap size via brk syscall when needed
+- Kernel doesn't implement disk api
+- FileDir/Files operates only with oberon file names at current work directory
+- FileDir.Enumerate didn't sort file names
+- By default used 80-bit prescission for intermediate real calculations
+
+Compiler specific issues / difference with RISC5:
+- Generated code compatible with generic 386 processor operated in linear protected mode
+- FPU required only when REAL data type in use
+- UML produce 32-bit result on 386
+- LED generate trap 255
+- MODULE* disable any compiler-generated traps
+- PROCEDURE* generate iret instruction
+- SYSTEM.REG/SYSTEM.LDREG accept register numbers:
+    0: EAX  1: ECX  2: EDX  3: ECX  4: ESP  5: EBP  6: ESI  7:  EDI
+- SYSTEM.LDPSR(0) generate CLI
+- SYSTEM.LDPSR(1) generate STI
+- SYSTEM.H(0) (remainder) not available on 386
+- SYSTEM.H(1) (cpu revision) generate trap 254
+- SYSTEM.COND accept numbers:
+    0: O  1: NO  2: B   3: AE   4: E    5: NE    6: BE   7: A
+    8: S  9: NS  10: P  11: NP  12: L  13: GE  14: LE  15: G
+- Compiler require this signatures for trap handlers:
+  trap 0 (NEW): PROCEDURE (VAR a: INTEGER; b, c: INTEGER); (*a result, b size*)
+  trap 255 (LED): PROCEDURE (a, b, c: INTEGER); (*a not used, b bits*)
+  trap 254 (ID): PROCEDURE (a, b, c: INTEGER): INTEGER; (*a, b not used*)
+  trap otherwise: PROCEDURE (c: INTEGER); (*never returns*)
+    trapnum = c MOD 100H; textpos = c DIV 100H MOD 1000000H;
+  address of trap handler fixed by loader
+- Internal calling convention:
+  1. Registers used by caller must be saved by caller
+  2. Parameters pushed from left to right
+      For RECORD/ARRAY push address, than tag/length
+  3. REAL result stored in ST0, otherwise in EAX
+- Code files has mostly the same format as RISC, through some changes are made:
+  1. Used ".int" file extension
+  2. Used version code 10 (0AH)
+  3. Used different fixup format. See module loader for details.

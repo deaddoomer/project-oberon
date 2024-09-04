@@ -1,0 +1,8 @@
+ORP.Compile Kernel.Mod FileDir.Mod Files.Mod Modules.Mod ~
+ORP.Compile Host.Mod Input.Mod Display.Mod ~
+ORP.Compile Viewers.Mod Fonts.Mod Texts.Mod Oberon.Mod MenuViewers.Mod TextFrames.Mod System.Mod Edit.Mod ~
+ORP.Compile ORS.Mod ORB.Mod ORG.Mod ORP.Mod ORTool.Mod ~
+ORP.Compile ORG.Mod ORP.Mod ORL.Mod ~
+ORP.Compile Graphics.Mod GraphicFrames.Mod GraphTool.Mod Rectangles.Mod Curves.Mod Draw.Mod ~
+ORP.Compile Blink.Mod Blinkers.Mod Checkers.Mod EBNF.Mod Hilbert.Mod MacroTool.Mod Math.Mod Sierpinski.Mod Stars.Mod Tools.Mod ~
+ORL.Link Modules ~

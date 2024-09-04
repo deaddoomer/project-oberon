@@ -1,0 +1,122 @@
+MODULE Host;  (*linux/386*)
+  IMPORT SYSTEM;
+
+  VAR init: SET;
+    syscall1: PROCEDURE (eax: INTEGER): INTEGER;
+    syscall2: PROCEDURE (eax, ebx: INTEGER): INTEGER;
+    syscall3: PROCEDURE (eax, ebx, ecx: INTEGER): INTEGER;
+    syscall4: PROCEDURE (eax, ebx, ecx, edx: INTEGER): INTEGER;
+    tty, kbmode, vtmode, kdmode: INTEGER;
+    vtmodestr: ARRAY 8 OF BYTE;
+
+  PROCEDURE Quit*(code: INTEGER);
+    VAR res: INTEGER;
+  BEGIN
+    res := syscall1(36); (*sync*)
+    IF 1 IN init THEN
+      res := syscall4(54, tty, 4B3AH, kdmode); EXCL(init, 1) (*ioctl(tty, KDSETMODE, kdmode)*)
+    END;
+    IF 30 IN init THEN
+      vtmodestr[0] := vtmode;
+      res := syscall4(54, tty, 5602H, SYSTEM.ADR(vtmodestr)); (*ioctl(tty, VT_SETMODE, vtmodestr)*)
+      EXCL(init, 30)
+    END;
+    IF 0 IN init THEN
+      res := syscall4(54, tty, 4B45H, kbmode); (*ioctl(tty, KDSKBMODE, kbmode)*)
+      EXCL(init, 0)
+    END;
+    IF 31 IN init THEN
+      res := syscall2(6, tty); (*close(tty)*)
+      EXCL(init, 31)
+    END;
+    res := syscall2(1, code) (*exit(code)*)
+  END Quit;
+
+  PROCEDURE Exit*;
+  BEGIN Quit(0)
+  END Exit;
+
+  PROCEDURE Sync*;
+    VAR res: INTEGER;
+  BEGIN res := syscall1(36) (*sync*)
+  END Sync;
+
+  PROCEDURE Abort*;
+    VAR res: INTEGER;
+  BEGIN
+    res := syscall3(37, syscall1(20), 6); (*kill(getpid(), SIGABRT)*)
+    res := syscall2(1, 1); (*exit*)
+    REPEAT UNTIL FALSE
+  END Abort;
+
+  PROCEDURE UnixToClock(t: INTEGER): INTEGER;
+    VAR z, era, y, doe, yoe, doy, mp, second, minute, hour, day, month, year: INTEGER;
+  BEGIN
+    z := (t DIV 86400) + 719468;
+    IF z >= 0 THEN era := z DIV 146097 ELSE era := (z - 146096) DIV 146097 END;
+    doe := z - era*146097;
+    yoe := (doe - doe DIV 1460 + doe DIV 36524 - doe DIV 146096) DIV 365;
+    doy := doe - (365*yoe + yoe DIV 4 - yoe DIV 100);
+    mp := (5*doy + 2) DIV 153;
+    y := yoe + era*400;
+    day := doy - (153*mp + 2) DIV 5 + 1;
+    IF mp < 10 THEN month := mp + 3 ELSE month := mp - 9 END;
+    IF month <= 2 THEN year := y + 1 ELSE year := y END;
+    year := year MOD 100;
+    hour := t DIV 3600 MOD 24;
+    minute := t DIV 60 MOD 60;
+    second := t MOD 60;
+    RETURN ((((year*10H + month)*20H + day)*20H + hour)*40H + minute)*40H + second
+  END UnixToClock;
+
+  PROCEDURE FileInfo*(name: ARRAY OF CHAR; VAR length, date: INTEGER);
+    VAR res: INTEGER; statbuf: ARRAY 24 OF INTEGER; 
+  BEGIN length := -1; date := 0;
+    res := syscall3(195, SYSTEM.ADR(name), SYSTEM.ADR(statbuf)); (*stat64*)
+    IF res = 0 THEN
+      IF (statbuf[12] = 0) & (statbuf[11] >= 0) THEN length := statbuf[11] END; (*st_size*)
+      date := UnixToClock(statbuf[20]) (*st_ctime*)
+    END
+  END FileInfo;
+
+  PROCEDURE Init*(sub: SET);
+    VAR res: INTEGER;
+  BEGIN
+    IF ~(31 IN init) THEN
+      tty := syscall4(5, SYSTEM.ADR("/dev/tty"), 2, 0); (*open("/dev/tty", O_RDWR)*)
+      IF tty >= 0 THEN INCL(init, 31) END
+    END;
+    IF 31 IN init THEN
+      IF (0 IN sub) & ~(0 IN init) THEN (*input: disable key processing by virtual console*)
+        res := syscall4(54, tty, 4B44H, SYSTEM.ADR(kbmode)); (*ioctl(tty, KDGKBMODE, &kbmode)*)
+        IF res = 0 THEN
+          INCL(init, 0);
+          res := syscall4(54, tty, 4B45H, 4) (*ioctl(tty, KDSKBMODE, K_OFF)*)
+        END
+      END;
+      IF 1 IN sub THEN
+        IF ~(30 IN init) THEN (*display: restore console switch mode on crash*)
+          res := syscall4(54, tty, 5601H, SYSTEM.ADR(vtmodestr)); (*ioctl(tty, VT_GETMODE, &vtmodestr)*)
+          IF res = 0 THEN
+            vtmode := vtmodestr[0]; INCL(init, 30);
+            vtmodestr[0] := 1; (* vtmodestr.mode = VT_PROCESS *)
+            res := syscall4(54, tty, 5602H, SYSTEM.ADR(vtmodestr)) (*ioctl(tty, VT_SETMODE, &vtmodestr)*)
+          END
+        END;
+        IF ~(1 IN init) & (30 IN init) THEN (*display: disable framebuffer overwriting by vitrual console*)
+          res := syscall4(54, tty, 4B3BH, SYSTEM.ADR(kdmode)); (*ioctl(tty, KDGETMODE, &kdmode)*)
+          IF res = 0 THEN
+            INCL(init, 1);
+            res := syscall4(54, tty, 4B3AH, 1) (*ioctl(tty, KDSETMODE, KD_GRAPHICS)*)
+          END
+        END
+      END
+    END
+  END Init;
+
+BEGIN
+  SYSTEM.PUT(SYSTEM.ADR(syscall1), SYSTEM.ADR($8B442404 CD80 C20400 6690 90$));
+  SYSTEM.PUT(SYSTEM.ADR(syscall2), SYSTEM.ADR($8B442408 8B5C2404 CD80 C20800 6690 90$));
+  SYSTEM.PUT(SYSTEM.ADR(syscall3), SYSTEM.ADR($8B44240C 8B5C2408 8B4C2404 CD80 C20C00 6690 90$));
+  SYSTEM.PUT(SYSTEM.ADR(syscall4), SYSTEM.ADR($8B442410 8B5C240C 8B4C2408 8B542404 CD80 C21000 6690 90$));
+END Host.

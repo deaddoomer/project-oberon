@@ -1,0 +1,191 @@
+MODULE Display;  (*NW 5.11.2013 / 17.1.2019*)
+  IMPORT SYSTEM, Host;
+
+  CONST black* = 0; white* = 1;  (*black = background*)
+    replace* = 0; paint* = 1; invert* = 2;  (*modes*)
+
+  TYPE Frame* = POINTER TO FrameDesc;
+    FrameMsg* = RECORD END ;
+    Handler* = PROCEDURE (F: Frame; VAR M: FrameMsg);
+    FrameDesc* = RECORD next*, dsc*: Frame;
+        X*, Y*, W*, H*: INTEGER;
+        handle*: Handler
+      END ;
+
+  VAR Base*, Width*, Height*: INTEGER;
+    arrow*, star*, hook*, updown*, block*, cross*, grey*: INTEGER;
+    (*a pattern is an array of bytes; the first is its width (< 32), the second its height, the rest the raster*)
+    fd, stride, bpp, xoff, yoff: INTEGER;
+
+  PROCEDURE Handle*(F: Frame; VAR M: FrameMsg);
+  BEGIN
+    IF (F # NIL) & (F.handle # NIL) THEN F.handle(F, M) END
+  END Handle;
+
+  (* raster ops *)
+    
+  PROCEDURE Dot*(col, x, y, mode: INTEGER);
+    VAR a: INTEGER; u, s: SET;
+  BEGIN a := Base + (Height - 1 - y + yoff) * stride + (x + xoff)*4;
+    s := SYSTEM.VAL(SET, ASR(ROR(col, 1), 31));
+    IF mode = paint THEN SYSTEM.GET(a, u); SYSTEM.PUT(a, u + s)
+    ELSIF mode = invert THEN SYSTEM.GET(a, u); SYSTEM.PUT(a, u / s)
+    ELSE (*mode = replace*) SYSTEM.PUT(a, s)
+    END
+  END Dot;
+
+  PROCEDURE ReplConst*(col, x, y, w, h, mode: INTEGER);
+    VAR i, a, end, step: INTEGER; u, s: SET;
+  BEGIN a := Base + ((Height-1) - (y+h-1) + yoff)*stride + (x+xoff)*4;
+    end := a + h*stride; step := stride - w*4;
+    s := SYSTEM.VAL(SET, ASR(ROR(col, 1), 31));
+    WHILE a < end DO
+      FOR i := 1 TO w DO
+        IF mode = paint THEN SYSTEM.GET(a, u); SYSTEM.PUT(a, u + s)
+        ELSIF mode = invert THEN SYSTEM.GET(a, u); SYSTEM.PUT(a, u / s)
+        ELSE (*mode = replace*) SYSTEM.PUT(a, s)
+        END;
+        INC(a, 4)
+      END;
+      INC(a, step)
+    END
+  END ReplConst;
+
+  PROCEDURE CopyPattern*(col, patadr, x, y, mode: INTEGER);  (*only for modes = paint, invert*)
+    VAR w, h, b: BYTE; i, j, a, c, end, step, line, w0, w1, w11, w4: INTEGER; u, s: SET;
+  BEGIN SYSTEM.GET(patadr, w); SYSTEM.GET(patadr + 1, h); INC(patadr, 2);
+    IF y + h > Height THEN h := -Height + h + y END; (*hack*)
+    a := Base + (Height - 1 - y + yoff) * stride + (x + xoff)*4;
+    line := (w + 7) DIV 8 * 8; w4 := w DIV 32; w1 := (w - w4*32) DIV 8; w11 := w1 * 8; w0 := w - w4*32 - w1*8;
+    step := stride + line*4 - (line - w)*4; end := patadr + (line * h) DIV 8;
+    WHILE patadr # end DO
+      FOR i := 1 TO w4 DO (* read words *)
+        SYSTEM.GET(patadr, c); INC(patadr);
+        FOR j := 1 TO 32 DO
+          SYSTEM.GET(a, u); s := SYSTEM.VAL(SET, ASR(ROR(c, j), 31));
+          IF mode = invert THEN SYSTEM.PUT(a, u / s) ELSE SYSTEM.PUT(a, u + s) END;
+          INC(a, 4)
+        END
+      END;
+      IF w1 >= 1 THEN (* read bytes *)
+        SYSTEM.GET(patadr, c); INC(patadr, w1); (*!!!*)
+        FOR j := 1 TO w11 DO
+          SYSTEM.GET(a, u); s := SYSTEM.VAL(SET, ASR(ROR(c, j), 31));
+          IF mode = invert THEN SYSTEM.PUT(a, u / s) ELSE SYSTEM.PUT(a, u + s) END;
+          INC(a, 4)
+        END
+      END;
+      IF w0 > 0 THEN (* read bits *)
+        SYSTEM.GET(patadr, b); INC(patadr); c := b;
+        FOR j := 1 TO w0 DO
+          SYSTEM.GET(a, u); s := SYSTEM.VAL(SET, ASR(ROR(c, j), 31));
+          IF mode = invert THEN SYSTEM.PUT(a, u / s) ELSE SYSTEM.PUT(a, u + s) END;
+          INC(a, 4)
+        END
+      END;
+      DEC(a, step)
+    END
+  END CopyPattern;
+
+  PROCEDURE CopyBlock*(sx, sy, w, h, dx, dy, mode: INTEGER); (*only for mode = replace*)
+    VAR sa, da, i, col, end, step: INTEGER;
+  BEGIN
+    sa := Base + ((Height-1) - sy + yoff)*stride + (sx+xoff)*4;
+    da := Base + ((Height-1) - dy + yoff)*stride + (dx+xoff)*4;
+    step := stride - w*4;
+    IF sa >= da THEN
+      end := sa + stride; DEC(sa, stride*h); DEC(da, stride*h);
+      WHILE sa # end DO
+        FOR i := 1 TO w DO
+          SYSTEM.GET(sa, col); SYSTEM.PUT(da, col);
+          INC(sa, 4); INC(da, 4)
+        END;
+        INC(sa, step); INC(da, step);
+      END
+    ELSE
+      INC(sa, w*4); INC(da, w*4); end := sa - stride*h; 
+      WHILE sa # end DO
+        FOR i := 1 TO w DO
+          DEC(sa, 4); DEC(da, 4);
+          SYSTEM.GET(sa, col); SYSTEM.PUT(da, col);
+        END;
+        DEC(sa, step); DEC(da, step);
+      END
+    END
+  END CopyBlock;
+
+  PROCEDURE ReplPattern*(col, patadr, x, y, w, h, mode: INTEGER);
+  (* pattern width = 32, fixed; pattern starts at patadr+4, for mode = invert only *)
+    VAR ph: BYTE; a, end, pta0, pta1, i, size, step: INTEGER; u, s: SET;
+  BEGIN SYSTEM.GET(patadr+1, ph); pta0 := patadr+4;
+    a := Base + (Height - 1 - y + yoff) * stride + (x + xoff)*4; end := a - stride*h;
+    size := ph*4; step := stride + w*4; pta1 := pta0 + size;
+    WHILE a > end DO
+      SYSTEM.GET(pta0, s); INC(pta0, 4);
+      IF pta0 = pta1 THEN pta0 := patadr+4 END;
+      FOR i := 1 TO w DO
+        SYSTEM.GET(a, u); SYSTEM.PUT(a, u / ASR(ROR(s, i), 31)); INC(a, 4)
+      END;
+      DEC(a, step)
+    END
+  END ReplPattern;
+
+  PROCEDURE Init;
+    VAR i, res: INTEGER;
+      buf: ARRAY 40 OF INTEGER;
+      msg: ARRAY 64 OF CHAR;
+      syscall2: PROCEDURE (eax, ebx: INTEGER): INTEGER;
+      syscall4: PROCEDURE (eax, ebx, ecx, edx: INTEGER): INTEGER;
+  BEGIN
+    (*
+      struct fb_var_screeninfo vinfo;
+      struct fb_fix_screeninfo finfo;
+      fd = open("/dev/fb0", O_RDRW, 0);
+      ioctl(fd, FBIOGET_FSCREENINFO, &finfo);
+      stride = finfo.line_length;
+      ioctl(fbfd, FBIOGET_VSCREENINFO, &vinfo);
+      Width = vinfo.xres; Height = vinfo.yres;
+      xoff = vinfo.xoffset; yoff = vinfo.yoffset; bpp = vinfo.bits_per_pixel;
+      Base = mmap(0, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    *)
+    SYSTEM.PUT(SYSTEM.ADR(syscall2), SYSTEM.ADR($8B442408 8B5C2404 CD80 C20800 6690 90$));
+    SYSTEM.PUT(SYSTEM.ADR(syscall4), SYSTEM.ADR($8B442410 8B5C240C 8B4C2408 8B542404 CD80 C21000 6690 90$));
+    REPEAT res := syscall4(5, SYSTEM.ADR("/dev/fb0"), 2, 0) UNTIL res # -4;
+    IF res >= 0 THEN
+      fd := res; res := syscall4(54, fd, 4602H, SYSTEM.ADR(buf));
+      IF res = 0 THEN
+        stride := buf[11];
+        res := syscall4(54, fd, 4600H, SYSTEM.ADR(buf));
+        IF res = 0 THEN
+          Width := buf[0]; Height := buf[1]; xoff := buf[4]; yoff := buf[5]; bpp := buf[6];
+          IF bpp = 32 THEN
+            buf[0] := 0; buf[1] := Width * Height * bpp DIV 8; buf[2] := 3; buf[3] := 1; buf[4] := fd; buf[5] := 0;
+            REPEAT res := syscall2(90, SYSTEM.ADR(buf)) UNTIL res # -4;
+            IF (res <= -4096) OR (res >= 0) THEN Base := res; res := 0
+            ELSE msg := "diplay error: failed to map framebuffer"
+            END
+          ELSE msg := "display error: unsupported pixel format"
+          END
+        ELSE msg := "display error: failed to get variadic screen info"
+        END
+      ELSE msg := "display error: failed to get fixed screen info"
+      END
+    ELSE msg := "display error: failed to open /dev/fb0"
+    END;
+    IF res # 0 THEN
+      i := 0; WHILE msg[i] # 0X DO INC(i) END; msg[i] := 0AX; INC(i);
+      REPEAT res := syscall4(4, 2, SYSTEM.ADR(msg), i) UNTIL res # -4;
+      Host.Abort
+    END;
+    Host.Init({1})
+  END Init;
+
+BEGIN Init;
+  arrow := SYSTEM.ADR($0F0F 0060 0070 0038 001C 000E 0007 8003 C101 E300 7700 3F00 1F00 3F00 7F00 FF00$);
+  star := SYSTEM.ADR($0F0F 8000 8220 8410 8808 9004 A002 C001 7F7F C001 A002 9004 8808 8410 8220 8000$);
+  hook := SYSTEM.ADR($0C0C 070F 8707 C703 E701 F700 7F00 3F00 1F00 0F00 0700 0300 01$);
+  updown := SYSTEM.ADR($080E 183C 7EFF 1818 1818 1818 FF7E3C18$);
+  block := SYSTEM.ADR($0808 FFFF C3C3 C3C3 FFFF$);
+  cross := SYSTEM.ADR($0F0F 0140 0220 0410 0808 1004 2002 4001 0000 4001 2002 1004 0808 0410 0220 0140$);
+  grey := SYSTEM.ADR($2002 0000 5555 5555 AAAA AAAA$)
+END Display.
