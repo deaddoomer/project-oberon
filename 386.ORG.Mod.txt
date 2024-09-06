@@ -1435,7 +1435,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   END StoreStruct;
 
   PROCEDURE CopyString*(VAR x, y: Item);  (* x := y *) 
-    VAR len, L, saveAX, saveSI, saveDI, reg, cond: LONGINT; z: Item;
+    VAR len, L, pc0: INTEGER; z, val, idx: Item;
    BEGIN len := x.type.len;
     IF len >= 0 THEN
       IF len <  y.b THEN ORS.Mark("string too long") END
@@ -1443,26 +1443,19 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       z.mode := RegI; z.type := ORB.intType; z.r := BP; z.a := x.a + TagOff;  (*open array len*)
       cmpcon(z, y.b); Trap(ccL, 3)
     END ;
-    loadAdr(x, {DI});
-    loadStringAdr(y, {SI});
-    (* move regs *)
-    saveDI := DI; saveSI := SI;
-    IF (x.r = SI) & (y.r = DI) THEN xchg(SI, DI)
-    ELSE
-      IF x.r # DI THEN SaveReg(DI, {AX, SI, DI}, saveDI); mov(DI, x); FreeReg(x.r) END;
-      IF y.r # SI THEN SaveReg(SI, {AX, SI, DI}, saveDI); mov(SI, y); FreeReg(y.r) END
-    END;
-    x.r := DI; y.r := SI;
-    SaveReg(AX, {AX, SI, DI}, saveAX);
-    (* strcpy *)
+    idx.mode := Reg; idx.type := ORB.intType; idx.r := GetReg(regs - {AX}); Gen2(33H, idx.r, idx.r);
+    loadAdr(x, regs - {AX}); x.mode := RegX; x.type := ORB.charType; x.scale := 1; x.index := idx.r; x.a := 0;
+    loadStringAdr(y, regs - {AX}); y.mode := RegX; y.type := ORB.charType; y.scale := 1; y.index := idx.r; y.a := 0;
+    val.mode := Reg; val.type := ORB.charType; val.r := GetReg({AX});
+    mov(val.r, y); Gen3v(88H, val.r, x);
     L := pc;
-    Gen1(0ACAAH); (*lodsb; stosb*)
-    Gen1(0A8FFH); (*test al,0xff*)
-    Gen1(JccD8 + ccNE); GenByte(L - (pc + 1)); (* jnz L *)
-    (* restore regs *)
-    RestoreReg(AX, saveAX);
-    RestoreReg(SI, saveSI);
-    RestoreReg(DI, saveDI)
+    Gen3(8DH, idx.r, idx.r, 1, anyoffset); (*lea idx,[idx+1]*)
+    Gen2(85H, val.r, val.r); (*test val,val*)
+    Gen1(JccD8 + ccE); pc0 := pc; GenByte(0); (*jz L*)
+    mov(val.r, y); Gen3v(88H, val.r, x);
+    Gen1(JmpD8); GenByte(L - (pc + 1));
+    PutByte(pc0, pc - (pc0 + 1)); (*fixup*)
+    FreeReg(val.r); FreeReg(y.r); FreeReg(x.r); FreeReg(idx.r)
    END CopyString;
   
   (* Code generation for parameters *)
