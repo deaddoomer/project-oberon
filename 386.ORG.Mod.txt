@@ -18,7 +18,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     ParOff = 8; TagOff = -4;
 
     (*internal item modes*)
-    Reg = 10; RegI = 11; Cond = 12; FStk = 13;
+    Reg = 10; RegI = 11; Cond = 12; FStk = 13; RegX = 14;
 
     (*frequently used opcodes*)
     JccD32 = 0F80H; JccD8 = 70H; JmpD32 = 0E9H; JmpD8 = 0EBH;
@@ -33,7 +33,8 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       mode*: INTEGER;
       type*: ORB.Type;
       a*, b*, r: LONGINT;
-      rdo*: BOOLEAN  (*read only*)
+      rdo*: BOOLEAN;  (*read only*)
+      scale, index: INTEGER
     END ;
 
   (* Item forms and meaning of fields:
@@ -45,7 +46,8 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     Reg    regno
     RegI   regno   off     -
     Cond  cond   Fchain  Tchain
-    FStk    -       -      -     *)
+    FStk    -       -      -
+    RegI   regno   off     -            (scale*index+base) *)
 
   VAR pc*, varsize: LONGINT;   (*program counter, data index*)
     tdx, strx: LONGINT;
@@ -206,7 +208,9 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   PROCEDURE FreeItem(VAR x: Item);
   BEGIN
     IF x.mode = FStk THEN decF
-    ELSIF (x.mode = Reg) OR (x.mode = RegI) & (x.r # NoReg) & ~(x.r IN reservedRegs) THEN FreeReg(x.r)
+    ELSIF x.mode IN {Reg, RegI, RegX} THEN
+      IF (x.r # NoReg) & ~(x.r IN reservedRegs) THEN FreeReg(x.r) END;
+      IF (x.mode = RegX) & (x.index # NoReg) & ~(x.index IN reservedRegs) THEN FreeReg(x.index) END
     END
   END FreeItem;
 
@@ -367,6 +371,8 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       Gen2(op, reg, x.r)
     ELSIF x.mode = RegI THEN
       Gen3(op, reg, x.r, x.a, anyoffset)
+    ELSIF x.mode = RegX THEN
+      Gen4(op, reg, x.scale, x.index, x.r, x.a, anyoffset)
     ELSE ORS.Mark("bad address")
     END;
   END Gen3v;
@@ -400,6 +406,13 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       IF (r = AX) & (x.r = NoReg) & (x.type.size = 4) THEN Gen1(0A1H); GenWord(x.a)
       ELSE Gen3(op, r, x.r, x.a, anyoffset)
       END;
+    ELSIF x.mode = RegX THEN
+      IF (x.r # NoReg) & ~(x.r IN usedRegs) OR (x.index # NoReg) & ~(x.index IN usedRegs) THEN
+        ORS.Mark("mov error")
+      END;
+      IF (r = AX) & (x.r = NoReg) & (x.index = NoReg) & (x.type.size = 4) THEN Gen1(0A1H); GenWord(x.a)
+      ELSE Gen4(op, r, x.scale, x.index, x.r, x.a, anyoffset)
+      END
     ELSIF x.mode = Cond THEN
       IF x.r = ccTrue THEN
         FixLink(x.b); FixLink(x.a); Gen1(0B8H + r); GenWord(1) (* mov r,1 *)
@@ -439,6 +452,10 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       IF x.a = 0 THEN Gen2(8BH, r, x.r) (* mov r,x *)
       ELSE Gen3(8DH, r, x.r, x.a, anyoffset) (* lea reg,[reg+offset] *)
       END
+    ELSIF x.mode = RegX THEN
+      IF (x.a = 0) & ((x.index = NoReg) OR (x.scale = 0)) THEN Gen2(8BH, r, x.r)
+      ELSE Gen4(8DH, r, x.scale, x.index, x.r, x.a, anyoffset)
+      END
     ELSE ORS.Mark("address error")
     END
   END lea;
@@ -449,9 +466,22 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     IF x.mode # Reg THEN
       IF x.mode = RegI THEN
         IF (x.r # NoReg) & ~(x.r IN usedRegs) THEN ORS.Mark("load error") END;
-        IF (x.r = NoReg) OR (x.r IN reservedRegs) THEN r := GetReg(hint) ELSE r := x.r END;
+        IF (x.r # NoReg) & ~(x.r IN reservedRegs) & ((x.r IN hint) OR (hint - usedRegs = {})) THEN r := x.r
+        ELSE r := GetReg(hint)
+        END;
         mov(r, x);
-        IF (x.r # NoReg) & ~(x.r IN reservedRegs) & (x.r # r) THEN FreeItem(x) END
+        IF (x.r # NoReg) & (x.r # r) THEN FreeReg(x.r) END
+      ELSIF x.mode = RegX THEN
+        IF (x.r # NoReg) & ~(x.r IN usedRegs) OR (x.index # NoReg) & ~(x.index IN usedRegs) THEN
+          ORS.Mark("load error")
+        END;
+        IF (x.r # NoReg) & ~(x.r IN reservedRegs) & ((x.r IN hint) OR (hint - usedRegs = {})) THEN r := x.r
+        ELSIF (x.index # NoReg) & ~(x.index IN reservedRegs) & ((x.index IN hint) OR (hint - usedRegs = {})) THEN r := x.index
+        ELSE r := GetReg(hint)
+        END;
+        mov(r, x);
+        IF (x.r # NoReg) & (x.r = r) THEN FreeReg(x.index) END;
+        IF (x.index # NoReg) & (x.index = r) THEN FreeReg(x.r) END
       ELSIF x.mode =  FStk THEN
         r := GetReg(hint);
         Gen3(8DH, SP, SP, -4, anyoffset); (* lea esp,[esp-4] *)
@@ -471,9 +501,20 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   BEGIN
     IF x.mode = RegI THEN
       IF (x.r # NoReg) & ~(x.r IN usedRegs) THEN ORS.Mark("loadAdr error") END;
-      IF  (x.r = NoReg) OR (x.r IN reservedRegs) THEN reg := GetReg(hint) ELSE reg := x.r END;
+      IF (x.r # NoReg) & ~(x.r IN reservedRegs) & ((x.r IN hint) OR (hint - usedRegs = {})) THEN reg := x.r ELSE reg := GetReg(hint) END;
       lea(reg, x);
-      IF (x.r # NoReg) & ~(x.r IN reservedRegs) & (x.r # reg) THEN FreeReg(x.r) END;
+      IF (x.r # NoReg) & (x.r # reg) THEN FreeReg(x.r) END
+    ELSIF x.mode = RegX THEN
+      IF (x.r # NoReg) & ~(x.r IN usedRegs) OR (x.index # NoReg) & ~(x.index IN usedRegs) THEN
+        ORS.Mark("load error")
+      END;
+      IF (x.r # NoReg) & ~(x.r IN reservedRegs) & ((x.r IN hint) OR (hint - usedRegs = {})) THEN reg := x.r
+      ELSIF (x.index # NoReg) & ~(x.index IN reservedRegs) & ((x.index IN hint) OR (hint - usedRegs = {})) THEN reg := x.index
+      ELSE reg := GetReg(hint)
+      END;
+      lea(reg, x);
+      IF (x.r # NoReg) & (x.r = reg) THEN FreeReg(x.index) END;
+      IF (x.index # NoReg) & (x.index = reg) THEN FreeReg(x.r) END
     ELSIF x.mode # Reg THEN
       reg := GetReg(hint); lea(reg, x)
     ELSE ORS.Mark("address error"); reg := AX
@@ -488,7 +529,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       Gen2(85H, x.r, x.r) (* test r32,r32 *)
     ELSIF (x.mode = Reg) & (y.mode = Reg) THEN
       Gen3v(3BH, x.r, y) (* cmp reg32,r/m32 *)
-    ELSIF (x.mode = Reg) & (y.mode IN {ORB.Var, ORB.Par, RegI}) THEN
+    ELSIF (x.mode = Reg) & (y.mode IN {ORB.Var, ORB.Par, RegI, RegX}) THEN
       IF y.type.size = 1 THEN
         IF x.r IN {SP..DI} THEN
           reg := GetReg(regs - {SP..DI});
@@ -498,7 +539,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
         END
       ELSE Gen3v(3BH, x.r, y) (* cmp reg32,r/m32 *)
       END
-    ELSIF (x.mode IN {ORB.Var, ORB.Par, RegI}) & (y.mode = Reg) THEN
+    ELSIF (x.mode IN {ORB.Var, ORB.Par, RegI, RegX}) & (y.mode = Reg) THEN
       IF x.type.size = 1 THEN
         IF y.r IN {SP..DI} THEN
           reg := GetReg(regs - {SP..DI});
@@ -508,7 +549,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
         END
       ELSE Gen3v(39H, y.r, x) (* cmp r/m32,reg32 *)
       END
-    ELSIF (x.mode IN {ORB.Var, ORB.Par, Reg, RegI}) & (y.mode = ORB.Const) THEN
+    ELSIF (x.mode IN {ORB.Var, ORB.Par, Reg, RegI, RegX}) & (y.mode = ORB.Const) THEN
       IF y.type.form = ORB.Proc THEN
         IF (x.mode = Reg) & (x.r = AX) THEN Gen1(3DH) (* cmp eax,imm32 *)
         ELSE Gen3v(81H, 7, x) (* cmp r/m32,imm32 *)
@@ -546,7 +587,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   PROCEDURE loadMemReg(VAR x: Item; targetSize: INTEGER; hint: SET);
   BEGIN
     IF (x.type.size < targetSize) OR (x.mode = ORB.Const) & (x.type.form # ORB.Proc) OR
-        ~(x.mode IN {ORB.Var, ORB.Par, RegI, Reg}) THEN
+        ~(x.mode IN {ORB.Var, ORB.Par, RegI, Reg, RegX}) THEN
       load(x, hint)
     END
   END loadMemReg;
@@ -596,7 +637,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
         ELSIF (form # ORB.Real) & (x.a = 1) THEN Gen1(0D9E8H) (*fld1*)
         ELSE MakeConstVarItem(x, x.type, x.a); Gen3v(op, 0, x) (*fld*)
         END
-      ELSIF mode IN {ORB.Var, ORB.Par, RegI} THEN
+      ELSIF mode IN {ORB.Var, ORB.Par, RegI, RegX} THEN
         Gen3v(op, 0, x); FreeItem(x) (*fld*)
       ELSE
         push(x);
@@ -762,7 +803,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
         load(x, hint); y.a := e; shift(0, x, y, hint, fse) (* shl x,y *)
       ELSE (* imul reg32,r/m32,imm *)
         loadMemReg(x, 4, hint);
-        IF x.mode IN {Reg, RegI} THEN
+        IF x.mode IN {Reg, RegI, RegX} THEN
           IF (y.a >= -128) & (y.a < 128) THEN Gen3v(6BH, x.r, x); GenByte(y.a)
           ELSE Gen3v(69H, x.r, x); GenWord(y.a)
           END;
@@ -841,7 +882,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       IF x.r >= 0 THEN x.a := x.a + y.val
       ELSE loadAdr(x, regs); x.mode := RegI; x.a := y.val
       END
-    ELSIF x.mode = RegI THEN x.a := x.a + y.val
+    ELSIF x.mode IN {RegI, RegX} THEN x.a := x.a + y.val
     ELSIF x.mode = ORB.Par THEN x.b := x.b + y.val
     END
   END Field;
@@ -851,7 +892,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   BEGIN s := x.type.base.size; lim := x.type.len;
     IF (y.mode = ORB.Const) & (lim >= 0) THEN
       IF (y.a < 0) OR (y.a >= lim) THEN ORS.Mark("bad index") END ;
-      IF x.mode IN {ORB.Var, RegI} THEN x.a := y.a * s + x.a
+      IF x.mode IN {ORB.Var, RegI, RegX} THEN x.a := y.a * s + x.a
       ELSIF x.mode = ORB.Par THEN x.b := y.a * s + x.b
       END
     ELSE load(y, regs);
@@ -867,15 +908,26 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
         END ;
         Trap(ccAE, 1)
       END ;
-      IF s # 1 THEN MakeConstItem(z, ORB.intType, s); mul(y, z, regs, FALSE) END ;
-      loadAdr(x, regs); addop(ORS.plus, x, y, regs, FALSE);
-      x.mode := RegI; x.a := 0
+      IF (s = 1) OR (s = 2) OR (s = 4) OR (s = 8) THEN
+        IF x.mode # RegI THEN
+          IF x.mode # Reg THEN loadAdr(x, regs) END;
+          x.a := 0
+        END;
+        x.mode := RegX; x.scale := s; x.index := y.r
+      ELSE
+        MakeConstItem(z, ORB.intType, s); mul(y, z, regs, FALSE);
+        loadAdr(x, regs);
+        IF y.mode = ORB.Const THEN x.a := y.a
+        ELSE addop(ORS.plus, x, y, regs, FALSE); x.a := 0
+        END;
+        x.mode := RegI
+      END
     END
   END Index;
 
   PROCEDURE DeRef*(VAR x: Item);
   BEGIN
-    IF x.mode IN {ORB.Var, ORB.Par, RegI} THEN
+    IF x.mode IN {ORB.Var, ORB.Par, RegI, RegX} THEN
       load(x, regs); IF check THEN cmpcon(x, 0); Trap(ccE, 4) END
     ELSIF x.mode # Reg THEN ORS.Mark("bad mode in DeRef")
     END ;
@@ -1004,7 +1056,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       END
     ELSIF x.type.form = ORB.Real THEN
       IF x.mode = ORB.Const THEN x.a := x.a + 7FFFFFFFH + 1
-      ELSIF x.mode IN {ORB.Var, ORB.Par, RegI} THEN
+      ELSIF x.mode IN {ORB.Var, ORB.Par, RegI, RegX} THEN
         Gen1(0D9EEH); incF; (*fldz*) Gen3v(0D8H, 4, x); FreeItem(x); x.mode := FStk (*fsub m32fp*)
       ELSE loadFloat(x); Gen1(0D9EEH); incF; Gen1(0DEE1H); decF (*x; fldz; fsubrp*)
       END
@@ -1038,11 +1090,18 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
         MakeConstItem(y, ORB.intType, 32 - e); shift(0, x, y, regs, FALSE); (* shl x,y *)
         MakeConstItem(y, ORB.intType, 32 - e); shift(2, x, y, regs, TRUE); (* ror x,y *)
       END
-    ELSIF ~check & positive & (y.mode IN {ORB.Var, ORB.Par, RegI}) THEN
-      IF (y.mode = RegI) & ((y.r = AX) OR (y.r = DX)) THEN
-        r := GetReg(regs - {AX, DX});
-        IF r IN {AX, DX} THEN ORS.Mark("too many regs in use") END;
-        y.mode := Reg; mov(r, y); FreeReg(y.r); y.mode := RegI; y.r := r
+    ELSIF ~check & positive & (y.mode IN {ORB.Var, ORB.Par, RegI, RegX}) THEN
+      IF y.mode IN {RegI, RegX} THEN
+        IF y.r IN {AX, DX} THEN
+          r := GetReg(regs - {AX, DX});
+          IF r IN {AX, DX} THEN ORS.Mark("too many regs in use") END;
+          Gen2(8BH, r, y.r); FreeReg(y.r); y.r := r
+        END;
+        IF (y.mode = RegX) & (y.index IN {AX, DX}) THEN
+          r := GetReg(regs - {AX, DX});
+          IF r IN {AX, DX} THEN ORS.Mark("too many regs in use") END;
+          Gen2(8BH, r, y.index); FreeReg(y.index); y.index := r
+        END
       END;
       load(x, {AX}); popax := FALSE; popdx := FALSE;
       IF x.r # AX THEN Gen1(50H + AX); popax := TRUE; mov(AX, x); x.r := AX END;
@@ -1137,14 +1196,14 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     VAR sizeop: INTEGER; temp: Item;
   BEGIN
     IF (op = ORS.minus) OR (op = ORS.rdiv) THEN
-      IF y.mode IN {ORB.Const, ORB.Var, ORB.Par, RegI} THEN
+      IF y.mode IN {ORB.Const, ORB.Var, ORB.Par, RegI, RegX} THEN
         loadFloat(x);
         IF y.mode = ORB.Const THEN MakeConstVarItem(y, y.type, y.a) END;
         IF y.type.form = ORB.Real THEN sizeop := 0D8H ELSE sizeop := 0DAH END; (*m32fp/m32int*)
         IF op = ORS.minus THEN op := 4 ELSE op := 6 END; (*fsub/fdiv*)
         Gen3v(sizeop, op, y);
         FreeItem(y)
-      ELSIF x.mode IN {ORB.Const, ORB.Var, ORB.Par, RegI} THEN
+      ELSIF x.mode IN {ORB.Const, ORB.Var, ORB.Par, RegI, RegX} THEN
         loadFloat(y);
         IF x.mode = ORB.Const THEN MakeConstVarItem(x, x.type, x.a) END;
         IF x.type.form = ORB.Real THEN sizeop := 0D8H ELSE sizeop := 0DAH END; (*m32fp/m32int*)
@@ -1160,7 +1219,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
         loadFloat(x); loadFloat(y); Gen1(op); decF
       END
     ELSIF op = ORS.plus THEN
-      IF y.mode IN  {ORB.Const, ORB.Var, ORB.Par, RegI} THEN
+      IF y.mode IN  {ORB.Const, ORB.Var, ORB.Par, RegI, RegX} THEN
         loadFloat(x);
         IF y.mode = ORB.Const THEN MakeConstVarItem(y, y.type, y.a) END;
         IF y.type.form = ORB.Real THEN sizeop := 0D8H ELSE sizeop := 0DAH END; (*m32fp/m32int*)
@@ -1175,7 +1234,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     ELSE (*op = ORS.times*)
       IF (x.mode # FStk) & (y.mode = FStk) THEN temp := x; x := y; y := temp END;
       loadFloat(x);
-      IF y.mode IN {ORB.Const, ORB.Var, ORB.Par, RegI} THEN
+      IF y.mode IN {ORB.Const, ORB.Var, ORB.Par, RegI, RegX} THEN
         IF y.mode = ORB.Const THEN MakeConstVarItem(y, y.type, y.a) END;
         IF y.type.form = ORB.Real THEN sizeop := 0D8H ELSE sizeop := 0DAH END;
         Gen3v(sizeop, 1, y); (*fmul*)
@@ -1231,7 +1290,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   PROCEDURE Compare(VAR x, y: Item; VAR op: INTEGER; xhint, yhint: SET);
     VAR size: INTEGER; temp: Item; rev: BOOLEAN; hint: SET;
   BEGIN rev := FALSE;
-    IF (x.mode = ORB.Const) OR (x.mode = Reg) & (y.mode IN {ORB.Var, ORB.Par, RegI}) THEN
+    IF (x.mode = ORB.Const) OR (x.mode = Reg) & (y.mode IN {ORB.Var, ORB.Par, RegI, RegX}) THEN
       temp := x; x := y; y := temp; op := reverse(op); rev := TRUE;
     END;
     IF y.mode = ORB.Const THEN
@@ -1263,7 +1322,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       temp := x; x := y; y := temp; op := reverse(op)
     END;
     IF used THEN r := GetReg(regs - {AX}); Gen2(8BH, r, AX) END;
-    IF y.mode IN {ORB.Const, ORB.Var, ORB.Par, RegI} THEN
+    IF y.mode IN {ORB.Const, ORB.Var, ORB.Par, RegI, RegX} THEN
       loadFloat(x);
       IF y.mode = ORB.Const THEN MakeConstVarItem(y, y.type, y.a) END;
       IF y.type.form = ORB.Real THEN formop := 0D8H ELSE formop := 0DAH END; (*m32fp/m32int*)
@@ -1891,7 +1950,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
 
   PROCEDURE Adr*(VAR x: Item);
   BEGIN 
-    IF x.mode IN {ORB.Var, ORB.Par, RegI} THEN loadAdr(x, regs)
+    IF x.mode IN {ORB.Var, ORB.Par, RegI, RegX} THEN loadAdr(x, regs)
     ELSIF (x.mode = ORB.Const) & (x.type.form = ORB.Proc) THEN loadMemReg(x, 4, regs)
     ELSIF (x.mode = ORB.Const) & (x.type.form = ORB.String) THEN loadStringAdr(x, regs)
     ELSE ORS.Mark("not addressable")
