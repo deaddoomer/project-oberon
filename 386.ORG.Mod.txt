@@ -1337,7 +1337,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
 
   PROCEDURE StringRelation*(op: INTEGER; VAR x, y: Item);   (* x := x < y *)
     (*x, y are char arrays or strings*)
-    VAR a, b: Item; L0, L1: INTEGER;
+    VAR a, b: Item; L0, L1, L2: INTEGER;
   BEGIN
     a.mode := Reg; a.type := ORB.charType; a.r := GetReg({AX});
     b.mode := Reg; b.type := ORB.charType; b.r := GetReg({BX,CX,DX});
@@ -1345,12 +1345,14 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     IF y.type.form = ORB.String THEN loadStringAdr(y, regs) ELSE loadAdr(y, regs) END;
     L0 := pc;
     Gen3(0FB6H, a.r, x.r, 0, anyoffset); (*movzx a,[x]*)
-    Gen3(8DH, x.r, x.r, 1, anyoffset); (*lea x,[x+1]*)
     Gen3(0FB6H, b.r, y.r, 0, anyoffset); (*movzx b,[y]*)
+    Gen3(8DH, x.r, x.r, 1, anyoffset); (*lea x,[x+1]*)
     Gen3(8DH, y.r, y.r, 1, anyoffset); (*lea y,[y+1]*)
     cmp(a, b); Gen1(JccD8 + ccNE); L1 := pc; GenByte(0);
-    cmpcon(a, 0); Gen1(JccD8 + ccNE); GenByte(L0 - (pc + 1));
+    cmpcon(a, 0); Gen1(JccD8 + ccE); L2 := pc; GenByte(0);
+    Gen1(JmpD8); GenByte(L0 - (pc + 1));
     PutByte(L1, pc - (L1 + 1));
+    PutByte(L2, pc - (L2 + 1));
     FreeReg(y.r); FreeReg(x.r); FreeReg(b.r); FreeReg(a.r);
     SetCC(x, relmap[op - ORS.eql])
   END StringRelation;
