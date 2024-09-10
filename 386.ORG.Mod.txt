@@ -2013,7 +2013,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
 
   PROCEDURE Bit*(VAR x, y: Item);
   BEGIN
-    IF x.mode = ORB.Const THEN x.mode := RegI
+    IF x.mode = ORB.Const THEN x.mode := RegI; x.r := NoReg
     ELSE load(x, regs); x.mode := RegI; x.a := 0
     END;
     IF y.mode = ORB.Const THEN Gen3v(0FBAH, 4, x); GenByte(y.a) (* bt dword[x],imm *)
