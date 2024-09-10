@@ -124,6 +124,10 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     WHILE i >= 0 DO GenByte(ASR(op, i*8)); DEC(i) END
   END Gen1;
 
+  PROCEDURE Gen1word(op, word: INTEGER);
+  BEGIN Gen1(op); GenWord(word)
+  END Gen1word;
+
   PROCEDURE Gen2(op, r, reg: INTEGER); (*op r,reg*)
     (*emit opcode with ModR/M reg/reg*)
   BEGIN
@@ -259,7 +263,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
         IF ODD(cond) THEN op := JccD8 + cond - 1 ELSE op := JccD8 + cond + 1 END;
         Gen1(op); pc0 := pc; GenByte(0)
       END;
-      Gen1(68H); GenWord(ORS.Pos() * 100H + num); (*push c*)
+      Gen1word(68H, ORS.Pos() * 100H + num); (*push c*)
       Gen3(0FFH, 2, NoReg, 0, {off32}); (*call [MTOrg]*)
       disp := (pc - 4) - fixorgD;
       IF disp < 4096 THEN PutWord(pc - 4, -1 * 10000H + disp); fixorgD := pc - 4
@@ -418,17 +422,17 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
         IF x.r > 0 THEN ORS.Mark("not allowed")
         ELSE
           PrepFixup(0, FixCode, x.r, x.a, offset, vno);
-          IF offset = 0 THEN Gen1(0B8H + r); GenWord(0); Fix(FixCode, x.r, vno) (*mov r,imm*)
+          IF offset = 0 THEN Gen1word(0B8H + r, 0); Fix(FixCode, x.r, vno) (*mov r,imm*)
           ELSE Gen3fixup(op, r, NoReg, offset, FixCode, x.r, vno) (*mov*)
           END
         END
-      ELSE Gen1(0B8H + r); GenWord(x.a)
+      ELSE Gen1word(0B8H + r, x.a)
       END
     ELSIF x.mode = ORB.Var THEN
       IF x.r > 0 THEN Gen3(op, r, BP, x.a, anyoffset) (* local *)
       ELSE
         PrepFixup(0, FixVar, x.r, x.a, offset, vno);
-        IF (r = AX) & (x.type.size = 4) & (offset = 0) THEN Gen1(0A1H); GenWord(0); Fix(FixVar, x.r, vno) (*mov r,[a]*)
+        IF (r = AX) & (x.type.size = 4) & (offset = 0) THEN Gen1word(0A1H, 0); Fix(FixVar, x.r, vno) (*mov r,[a]*)
         ELSE Gen3fixup(op, r, NoReg, offset, FixVar, x.r, vno)
         END
       END
@@ -441,20 +445,20 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       END
     ELSIF x.mode = RegI THEN
       IF (x.r # NoReg) & ~(x.r IN usedRegs) THEN ORS.Mark("mov error") END;
-      IF (r = AX) & (x.r = NoReg) & (x.type.size = 4) THEN Gen1(0A1H); GenWord(x.a)
+      IF (r = AX) & (x.r = NoReg) & (x.type.size = 4) THEN Gen1word(0A1H, x.a)
       ELSE Gen3(op, r, x.r, x.a, anyoffset)
       END;
     ELSIF x.mode = RegJ THEN
       IF (x.r # NoReg) & ~(x.r IN usedRegs) THEN ORS.Mark("mov error") END;
       PrepFixup(x.a, x.fixup, x.mno, x.vno, offset, vno);
-      IF (r = AX) & (x.r = NoReg) & (x.type.size = 4) & (offset = 0) THEN Gen1(0A1H); GenWord(0); Fix(x.fixup, x.mno, vno)
+      IF (r = AX) & (x.r = NoReg) & (x.type.size = 4) & (offset = 0) THEN Gen1word(0A1H, 0); Fix(x.fixup, x.mno, vno)
       ELSE Gen3v(op, r, x)
       END
     ELSIF x.mode = RegX THEN
       IF (x.r # NoReg) & ~(x.r IN usedRegs) OR (x.index # NoReg) & ~(x.index IN usedRegs) THEN
         ORS.Mark("mov error")
       END;
-      IF (r = AX) & (x.r = NoReg) & (x.index = NoReg) & (x.type.size = 4) THEN Gen1(0A1H); GenWord(x.a)
+      IF (r = AX) & (x.r = NoReg) & (x.index = NoReg) & (x.type.size = 4) THEN Gen1word(0A1H, x.a)
       ELSE Gen4(op, r, x.scale, x.index, x.r, x.a, anyoffset)
       END
     ELSIF x.mode = RegY THEN
@@ -462,18 +466,18 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
         ORS.Mark("mov error")
       END;
       PrepFixup(x.a, x.fixup, x.mno, x.vno, offset, vno);
-      IF (r = AX) & (x.r = NoReg) & ((x.index = NoReg) OR (x.scale = 0)) & (x.type.size = 4) & (offset = 0) THEN Gen1(0A1H); GenWord(0); Fix(x.fixup, x.mno, vno)
+      IF (r = AX) & (x.r = NoReg) & ((x.index = NoReg) OR (x.scale = 0)) & (x.type.size = 4) & (offset = 0) THEN Gen1word(0A1H, 0); Fix(x.fixup, x.mno, vno)
       ELSE Gen3v(op, r, x)
       END
     ELSIF x.mode = Cond THEN
       IF x.r = ccTrue THEN
-        FixLink(x.b); FixLink(x.a); Gen1(0B8H + r); GenWord(1) (* mov r,1 *)
+        FixLink(x.b); FixLink(x.a); Gen1word(0B8H + r, 1) (* mov r,1 *)
       ELSIF x.r = ccFalse THEN
-        FixLink(x.a); FixLink(x.b); Gen1(0B8H + r); GenWord(0)  (* mov r,0 *)
+        FixLink(x.a); FixLink(x.b); Gen1word(0B8H + r, 0)  (* mov r,0 *)
       ELSIF x.r IN {0..15} THEN
         Gen1(JccD8 + negated(x.r)); GenByte(7);
-        FixLink(x.b); Gen1(0B8H + r); GenWord(1); Gen1(JmpD8); GenByte(5);
-        FixLink(x.a); Gen1(0B8H + r); GenWord(0);
+        FixLink(x.b); Gen1word(0B8H + r, 1); Gen1(JmpD8); GenByte(5);
+        FixLink(x.a); Gen1word(0B8H + r, 0);
       ELSE ORS.Mark("invalid cc")
       END
     ELSIF x.mode = FStk THEN
@@ -494,7 +498,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       IF x.r > 0 THEN ORS.Mark("not allowed")
       ELSE
         PrepFixup(0, FixCode, x.r, x.a, offset, vno);
-        IF offset = 0 THEN Gen1(0B8H + r); GenWord(0); Fix(FixCode, x.r, vno) (*mov reg,adr*)
+        IF offset = 0 THEN Gen1word(0B8H + r, 0); Fix(FixCode, x.r, vno) (*mov reg,adr*)
         ELSE Gen3fixup(8DH, r, NoReg, offset, FixCode, x.r, vno) (*lea*)
         END
       END
@@ -502,7 +506,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       IF x.r > 0 THEN Gen3(8DH, r, BP, x.a, anyoffset) (* lea reg,[ebp+offset] *)
       ELSE
         PrepFixup(0, FixVar, x.r, x.a, offset, vno);
-        IF offset = 0 THEN Gen1(0B8H + r); GenWord(0); Fix(FixVar, x.r, vno) (*mov reg,adr*)
+        IF offset = 0 THEN Gen1word(0B8H + r, 0); Fix(FixVar, x.r, vno) (*mov reg,adr*)
         ELSE Gen3fixup(8DH, r, NoReg, offset, FixVar, x.r, vno)
         END
       END
@@ -510,20 +514,20 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       Gen3(8BH, r, BP, x.a, anyoffset); (* mov reg,PTR[ebp+offset1] *)
       IF x.b # 0 THEN Gen3(8DH, r, r, x.b, anyoffset) END (* lea reg,[reg+offset2] *)
     ELSIF x.mode = RegI THEN
-      IF x.r = NoReg THEN Gen1(0B8H + r); GenWord(x.a) (*mov r,imm*)
+      IF x.r = NoReg THEN Gen1word(0B8H + r, x.a) (*mov r,imm*)
       ELSIF x.a = 0 THEN Gen2(8BH, r, x.r) (*mov r,x*)
       ELSE Gen3(8DH, r, x.r, x.a, anyoffset) (* lea reg,[reg+offset] *)
       END
     ELSIF x.mode = RegJ THEN
       PrepFixup(x.a, x.fixup, x.mno, x.vno, offset, vno);
-      IF x.r = NoReg THEN Gen1(0B8H + r); GenWord(0) (*mov r,imm*)
+      IF x.r = NoReg THEN Gen1word(0B8H + r, 0) (*mov r,imm*)
       ELSE Gen3(8DH, r, x.r, 0, {off32}) (*lea r,[reg+adr]*)
       END;
       Fix(x.fixup, x.mno, vno);
       IF offset # 0 THEN Gen3(8DH, r, r, offset, anyoffset) END (*lea r,[r+offset]*)
     ELSIF x.mode = RegX THEN
       IF (x.r = NoReg) & ((x.index = NoReg) OR (x.scale = 0)) THEN
-        Gen1(0B8H + r); GenWord(x.a) (*mov r,imm*)
+        Gen1word(0B8H + r, x.a) (*mov r,imm*)
       ELSIF (x.a = 0) & ((x.index = NoReg) OR (x.scale = 0)) THEN
         IF r # x.r THEN Gen2(8BH, r, x.r) END (*mov r,xr*)
       ELSE Gen4(8DH, r, x.scale, x.index, x.r, x.a, anyoffset)
@@ -531,7 +535,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     ELSIF x.mode = RegY THEN
       PrepFixup(x.a, x.fixup, x.mno, x.vno, offset, vno);
       IF (x.r = NoReg) & ((x.index = NoReg) OR (x.scale = 0)) THEN
-        Gen1(0B8H + r); GenWord(0) (*mov r,imm*)
+        Gen1word(0B8H + r, 0) (*mov r,imm*)
       ELSE
         Gen4(8DH, r, x.scale, x.index, x.r, 0, {off32}) (*lea r,[scale*index+r+adr]*)
       END;
@@ -648,7 +652,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
             END
           ELSE Gen2(83H, 7, x.r); GenByte(y.a) (* cmp reg32,imm8 *)
           END
-        ELSIF x.r = AX THEN Gen1(3DH); GenWord(y.a) (* cmp eax,imm32 *)
+        ELSIF x.r = AX THEN Gen1word(3DH, y.a) (* cmp eax,imm32 *)
         ELSE Gen2(81H, 7, x.r); GenWord(y.a) (* cmp reg32,imm32 *)
         END
       ELSIF x.type.size = 1 THEN
@@ -683,11 +687,11 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     IF x.mode = ORB.Const THEN (*push imm*)
       IF x.type.form = ORB.Proc THEN
         PrepFixup(0, FixCode, x.r, x.a, offset, vno);
-        IF offset = 0 THEN Gen1(68H); GenWord(0); Fix(FixCode, x.r, vno)
+        IF offset = 0 THEN Gen1word(68H, 0); Fix(FixCode, x.r, vno)
         ELSE Gen3v(0FFH, 6, x)
         END
       ELSIF (x.a >= -128) & (x.a <= 127) THEN Gen1(6AH); GenByte(x.a)
-      ELSE Gen1(68H); GenWord(x.a)
+      ELSE Gen1word(68H, x.a)
       END
     ELSIF x.mode = FStk THEN
       Gen3(8DH, SP, SP, -4, anyoffset); (*lea esp,[esp-4]*)
@@ -758,7 +762,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     VAR reg: INTEGER;
   BEGIN
     reg := GetReg(hint);
-    Gen1(0B8H + reg); GenWord(0); Fix(FixVar, 0, varsize + x.a);
+    Gen1word(0B8H + reg, 0); Fix(FixVar, 0, varsize + x.a);
     x.mode := Reg; x.r := reg
   END loadStringAdr;
 
@@ -848,8 +852,8 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
           GenByte(y.a)
         ELSE load(x, {AX});
           IF x.r = AX THEN
-            IF op = ORS.plus THEN Gen1(5H); GenWord(y.a)
-            ELSE Gen1(2DH); GenWord(y.a)
+            IF op = ORS.plus THEN Gen1word(5H, y.a)
+            ELSE Gen1word(2DH, y.a)
             END
           ELSE
             IF op = ORS.plus THEN Gen2(81H, 0, x.r); GenWord(y.a)
@@ -944,7 +948,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
         ELSIF op = ORS.times THEN op := 25H
         ELSE (*op = ORB.rdiv*) op := 35H
         END;
-        Gen1(op); GenWord(yint)
+        Gen1word(op, yint)
       ELSE
         IF op = ORS.plus THEN op := 1
         ELSIF op = ORS.times THEN op := 4
@@ -1106,8 +1110,8 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     IF x.mode # Cond THEN loadCond(x) END ;
     cond := negated(x.r);
     IF cond # ccTrue THEN
-      IF cond = ccFalse THEN Gen1(JmpD32); GenWord(x.a); x.a := pc - 4 (* jmp rel32 *)
-      ELSIF cond IN {0..15} THEN Gen1(JccD32 + cond); GenWord(x.a); x.a := pc - 4 (* jcc rel32 *)
+      IF cond = ccFalse THEN Gen1word(JmpD32, x.a); x.a := pc - 4 (* jmp rel32 *)
+      ELSIF cond IN {0..15} THEN Gen1word(JccD32 + cond, x.a); x.a := pc - 4 (* jcc rel32 *)
       ELSE ORS.Mark("invalid cc")
       END
     END;
@@ -1126,8 +1130,8 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     IF x.mode # Cond THEN loadCond(x) END ;
     cond := x.r;
     IF cond # ccFalse THEN
-      IF cond = ccTrue THEN Gen1(JmpD32); GenWord(x.b); x.b := pc - 4 (* jmp rel32 *)
-      ELSIF cond IN {0..15} THEN Gen1(JccD32 + cond); GenWord(x.b); x.b := pc - 4 (* jcc rel32 *)
+      IF cond = ccTrue THEN Gen1word(JmpD32, x.b); x.b := pc - 4 (* jmp rel32 *)
+      ELSIF cond IN {0..15} THEN Gen1word(JccD32 + cond, x.b); x.b := pc - 4 (* jcc rel32 *)
       ELSE ORS.Mark("invalid cc")
       END
     END;
@@ -1486,8 +1490,8 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       IF (x.mode = ORB.Var) & (x.r <= 0) & (y.r = AX) THEN (* mov [x],eax *)
         PrepFixup(0, FixVar, x.r, x.a, offset, vno);
         IF offset = 0 THEN
-          IF x.type.size = 1 THEN Gen1(0A2H) ELSE Gen1(0A3H) END;
-          GenWord(0); Fix(FixVar, x.r, vno)
+          IF x.type.size = 1 THEN Gen1word(0A2H, 0) ELSE Gen1word(0A3H, 0) END;
+          Fix(FixVar, x.r, vno)
         ELSIF x.type.size = 1 THEN
            Gen3v(88H, y.r, x) (*mov byte[x],y*)
         ELSE
@@ -1643,7 +1647,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   END Here;
 
   PROCEDURE FJump*(VAR L: LONGINT);
-  BEGIN Gen1(JmpD32); GenWord(L); L := pc - 4
+  BEGIN Gen1word(JmpD32, L); L := pc - 4
   END FJump;
 
   PROCEDURE CFJump*(VAR x: Item);
@@ -1652,8 +1656,8 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     IF x.mode # Cond THEN loadCond(x) END;
     cond := negated(x.r);
     IF cond # ccFalse THEN
-      IF cond = ccTrue THEN Gen1(JmpD32); GenWord(x.a); x.a := pc - 4 (* jmp rel32 *)
-      ELSIF cond IN {0..15} THEN Gen1(JccD32 + cond); GenWord(x.a); x.a := pc - 4 (* jcc rel32 *)
+      IF cond = ccTrue THEN Gen1word(JmpD32, x.a); x.a := pc - 4 (* jmp rel32 *)
+      ELSIF cond IN {0..15} THEN Gen1word(JccD32 + cond, x.a); x.a := pc - 4 (* jcc rel32 *)
       ELSE ORS.Mark("invalid cc")
       END
     END;
@@ -1664,7 +1668,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     VAR disp: INTEGER;
   BEGIN disp := L - (pc + 2);
     IF (disp >= -128) & (disp <= 127) THEN Gen1(JmpD8); GenByte(disp)
-    ELSE Gen1(JmpD32); GenWord(disp - 3)
+    ELSE Gen1word(JmpD32, disp - 3)
     END
   END BJump;
 
@@ -1731,7 +1735,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       IF x.r >= 0 THEN Gen1(0E8H); GenWord(x.a - (pc + 4)) (*call rel32*)
       ELSE (*imported*)
         PrepFixup(0, FixCode, x.r, x.a, offset, vno);
-        IF offset = 0 THEN Gen1(0E8H); GenWord(0); Fix(FixCodeRel, x.r, vno) (*call rel32*)
+        IF offset = 0 THEN Gen1word(0E8H, 0); Fix(FixCodeRel, x.r, vno) (*call rel32*)
         ELSE load(x, regs); Gen2(0FFH, 2, x.r); FreeReg(x.r) (*call reg*)
         END
       END
@@ -1836,8 +1840,8 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     IF x.a = 0 THEN cond := negated(x.r)
     ELSE
       IF x.r # ccFalse THEN
-        IF x.r = ccTrue THEN Gen1(JmpD32) ELSE Gen1(JccD32 + x.r) END;
-        GenWord(x.b); x.b := pc - 4
+        IF x.r = ccTrue THEN Gen1word(JmpD32, x.b) ELSE Gen1word(JccD32 + x.r, x.b) END;
+        x.b := pc - 4
       END;
       FixLink(x.a); cond := ccTrue
     END ;
@@ -1988,7 +1992,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     IF y.mode = ORB.Const THEN (*adc x,imm*)
       load(x, {AX});
       IF (y.a >= -128) & (y.a <= 127) THEN Gen2(83H, 2, x.r); GenByte(y.a)
-      ELSIF x.r = AX THEN Gen1(15H); GenWord(y.a)
+      ELSIF x.r = AX THEN Gen1word(15H, y.a)
       ELSE Gen2(81H, 2, x.r); GenWord(y.a)
       END
     ELSE load(x, regs); loadMemReg(y, 4, regs); Gen3v(13H, x.r, y); FreeItem(y) (*adc x,y*)
@@ -2000,7 +2004,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     IF y.mode = ORB.Const THEN (*sbb x,imm*)
       load(x, {AX});
       IF (y.a >= -128) & (y.a <= 127) THEN Gen2(83H, 3, x.r); GenByte(y.a)
-      ELSIF x.r = AX THEN Gen1(1DH); GenWord(y.a)
+      ELSIF x.r = AX THEN Gen1word(1DH, y.a)
       ELSE Gen2(81H, 3, x.r); GenWord(y.a)
       END
     ELSE load(x, regs); loadMemReg(y, 4, regs); Gen3v(1BH, x.r, y); FreeItem(y) (*sbb x,y*)
