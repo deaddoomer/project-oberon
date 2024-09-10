@@ -804,14 +804,14 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     END
   END xchg;
 
-  PROCEDURE shift(fct: INTEGER; VAR x, y: Item; hint: SET; fse: BOOLEAN);
+  PROCEDURE shift(fct: INTEGER; VAR x, y: Item; hint: SET);
     VAR op, r: INTEGER; usecx: BOOLEAN;
   BEGIN
     IF fct = 0 THEN op := 4 (* shl *) ELSIF fct = 1 THEN op := 7 (* sar *) ELSE op := 1 (* ror *) END;
     IF y.mode = ORB.Const THEN
       IF y.a # 0 THEN
         load(x, hint);
-        IF ~fse & (fct = 0) THEN (* shl *)
+        IF fct = 0 THEN (* shl *)
           IF y.a = 1 THEN Gen4(8DH, x.r, 2, x.r, NoReg, 0, anyoffset) (* lea x,[x*2] *)
           ELSIF y.a = 2 THEN Gen4(8DH, x.r, 4, x.r, NoReg, 0, anyoffset) (* lea x,[x*4] *)
           ELSIF y.a = 3 THEN Gen4(8DH, x.r, 8, x.r, NoReg, 0, anyoffset) (* lea x,[x*8] *)
@@ -879,18 +879,18 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     RETURN m
   END log2;
 
-  PROCEDURE mul(VAR x, y: Item; hint: SET; fse: BOOLEAN);
+  PROCEDURE mul(VAR x, y: Item; hint: SET);
     VAR e, reg: INTEGER; temp: Item;
   BEGIN
     IF (x.mode = ORB.Const) & (y.mode = ORB.Const) THEN x.a := x.a * y.a
     ELSIF (x.mode = ORB.Const) & (x.a = 0) OR (y.mode = ORB.Const) & (y.a = 0) THEN
       FreeItem(x); FreeItem(y); x.mode := ORB.Const; x.a := 0
-    ELSIF ~fse & (x.mode = ORB.Const) & (x.a = 1) THEN x := y
-    ELSIF ~fse & (y.mode = ORB.Const) & (y.a = 1) THEN (* nop *)
+    ELSIF (x.mode = ORB.Const) & (x.a = 1) THEN x := y
+    ELSIF (y.mode = ORB.Const) & (y.a = 1) THEN (* nop *)
     ELSIF (x.mode = ORB.Const) OR (y.mode = ORB.Const) THEN
       IF y.mode # ORB.Const THEN temp := x; x := y; y := temp END;
       IF (y.mode = ORB.Const) & (y.a >= 2) & (log2(y.a, e) = 1) THEN
-        load(x, hint); y.a := e; shift(0, x, y, hint, fse) (* shl x,y *)
+        load(x, hint); y.a := e; shift(0, x, y, hint) (* shl x,y *)
       ELSE (* imul reg32,r/m32,imm *)
         loadMemReg(x, 4, hint);
         IF x.mode IN {Reg, RegI, RegJ, RegX, RegY} THEN
@@ -1009,7 +1009,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
         x.scale := s; x.index := y.r;
         IF x.mode = RegJ THEN x.mode := RegY ELSE x.mode := RegX END
       ELSE
-        MakeConstItem(z, ORB.intType, s); mul(y, z, regs, FALSE);
+        MakeConstItem(z, ORB.intType, s); mul(y, z, regs);
         loadAdr(x, regs);
         IF y.mode = ORB.Const THEN x.a := y.a
         ELSE addop(ORS.plus, x, y, regs, FALSE); x.a := 0
@@ -1166,7 +1166,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   END AddOp;
 
   PROCEDURE MulOp*(VAR x, y: Item);   (* x := x * y *)
-  BEGIN mul(x, y, regs, TRUE)
+  BEGIN mul(x, y, regs)
   END MulOp;
 
   PROCEDURE DivOp*(op: LONGINT; VAR x, y: Item);   (* x := x op y *)
@@ -1178,11 +1178,11 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     ELSIF (x.mode = ORB.Const) & (y.mode = ORB.Const) THEN
       IF op = ORS.div THEN x.a := x.a DIV y.a ELSE x.a := x.a MOD y.a END
     ELSIF (y.mode = ORB.Const) & (y.a >= 2) & (log2(y.a, e) = 1) THEN
-      IF op = ORS.div THEN y.a := e; shift(1, x, y, regs, TRUE) (* sar x,y *)
+      IF op = ORS.div THEN y.a := e; shift(1, x, y, regs) (* sar x,y *)
       ELSIF e <= 16 THEN y.a := y.a-1; sop(ORS.times, x, y, regs) (* and x,(y-1) *)
       ELSE
-        MakeConstItem(y, ORB.intType, 32 - e); shift(0, x, y, regs, FALSE); (* shl x,y *)
-        MakeConstItem(y, ORB.intType, 32 - e); shift(2, x, y, regs, TRUE); (* ror x,y *)
+        MakeConstItem(y, ORB.intType, 32 - e); shift(0, x, y, regs); (* shl x,y *)
+        MakeConstItem(y, ORB.intType, 32 - e); shift(2, x, y, regs); (* ror x,y *)
       END
     ELSIF ~check & positive & (y.mode IN {ORB.Var, ORB.Par, RegI, RegJ, RegX, RegY}) THEN
       IF y.mode IN {RegI, RegJ, RegX, RegY} THEN
@@ -1345,7 +1345,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     VAR y: Item;
   BEGIN
     IF x.mode = ORB.Const THEN x.a := LSL(1, x.a) 
-    ELSE MakeConstItem(y, x.type, 1); shift(0, y, x, regs, FALSE); x := y (*shl y,x*)
+    ELSE MakeConstItem(y, x.type, 1); shift(0, y, x, regs); x := y (*shl y,x*)
     END
   END Singleton;
 
@@ -1356,10 +1356,10 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       IF x.a <= y.a THEN x.a := LSL(2, y.a) - LSL(1, x.a) ELSE x.a := 0 END
     ELSE
       IF x.mode = ORB.Const THEN x.a := LSL(-1, x.a)
-      ELSE MakeConstItem(z, x.type, -1); shift(0, z, x, regs - {CX}, FALSE); x := z (* shl *)
+      ELSE MakeConstItem(z, x.type, -1); shift(0, z, x, regs - {CX}); x := z (* shl *)
       END ;
       IF y.mode = ORB.Const THEN y.a := LSL(-2, y.a)
-      ELSE MakeConstItem(z, y.type, -2); shift(0, z, y, regs, FALSE); y := z (* shl *)
+      ELSE MakeConstItem(z, y.type, -2); shift(0, z, y, regs); y := z (* shl *)
       END ;
       IF (x.mode # ORB.Const) OR (x.a # 0) THEN
         sop(ORS.minus, x, y, regs)
@@ -1517,9 +1517,9 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
           cmpcon(z, 0); Gen1(JccD8 + ccE); pc0 := pc; GenByte(0);
           IF s = 1 THEN
             Gen3(8DH, z.r, z.r, 3, anyoffset); (*lea z,[z+3]*)
-            MakeConstItem(c, z.type, 2); shift(1, z, c, {CX}, FALSE); (*sar*)
+            MakeConstItem(c, z.type, 2); shift(1, z, c, {CX}); (*sar*)
           ELSIF s # 4 THEN
-            MakeConstItem(c, ORB.intType, s DIV 4); mul(z, c, {CX}, FALSE)
+            MakeConstItem(c, ORB.intType, s DIV 4); mul(z, c, {CX})
           END ;
           IF check THEN
             cmpcon(z, (x.type.size + 3) DIV 4); Trap(ccG, 3)
@@ -1980,7 +1980,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   END Len;
 
   PROCEDURE Shift*(fct: LONGINT; VAR x, y: Item);
-  BEGIN shift(fct, x, y, regs, TRUE)
+  BEGIN shift(fct, x, y, regs)
   END Shift;
 
   PROCEDURE ADC*(VAR x, y: Item);
@@ -2008,7 +2008,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   END SBC;
 
   PROCEDURE UML*(VAR x, y: Item);
-  BEGIN mul(x, y, regs, TRUE)
+  BEGIN mul(x, y, regs)
   END UML;
 
   PROCEDURE Bit*(VAR x, y: Item);
