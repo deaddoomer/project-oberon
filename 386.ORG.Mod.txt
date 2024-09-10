@@ -444,27 +444,19 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
         Gen2(8BH, r, x.r) (* mov r,x *)
       END
     ELSIF x.mode = RegI THEN
-      IF (x.r # NoReg) & ~(x.r IN usedRegs) THEN ORS.Mark("mov error") END;
       IF (r = AX) & (x.r = NoReg) & (x.type.size = 4) THEN Gen1word(0A1H, x.a)
       ELSE Gen3(op, r, x.r, x.a, anyoffset)
       END;
     ELSIF x.mode = RegJ THEN
-      IF (x.r # NoReg) & ~(x.r IN usedRegs) THEN ORS.Mark("mov error") END;
       PrepFixup(x.a, x.fixup, x.mno, x.vno, offset, vno);
       IF (r = AX) & (x.r = NoReg) & (x.type.size = 4) & (offset = 0) THEN Gen1word(0A1H, 0); Fix(x.fixup, x.mno, vno)
       ELSE Gen3v(op, r, x)
       END
     ELSIF x.mode = RegX THEN
-      IF (x.r # NoReg) & ~(x.r IN usedRegs) OR (x.index # NoReg) & ~(x.index IN usedRegs) THEN
-        ORS.Mark("mov error")
-      END;
       IF (r = AX) & (x.r = NoReg) & (x.index = NoReg) & (x.type.size = 4) THEN Gen1word(0A1H, x.a)
       ELSE Gen4(op, r, x.scale, x.index, x.r, x.a, anyoffset)
       END
     ELSIF x.mode = RegY THEN
-      IF (x.r # NoReg) & ~(x.r IN usedRegs) OR (x.index # NoReg) & ~(x.index IN usedRegs) THEN
-        ORS.Mark("mov error")
-      END;
       PrepFixup(x.a, x.fixup, x.mno, x.vno, offset, vno);
       IF (r = AX) & (x.r = NoReg) & ((x.index = NoReg) OR (x.scale = 0)) & (x.type.size = 4) & (offset = 0) THEN Gen1word(0A1H, 0); Fix(x.fixup, x.mno, vno)
       ELSE Gen3v(op, r, x)
@@ -550,16 +542,12 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   BEGIN
     IF x.mode # Reg THEN
       IF x.mode IN {RegI, RegJ} THEN
-        IF (x.r # NoReg) & ~(x.r IN usedRegs) THEN ORS.Mark("load error") END;
         IF (x.r # NoReg) & ~(x.r IN reservedRegs) & ((x.r IN hint) OR (hint - usedRegs = {})) THEN r := x.r
         ELSE r := GetReg(hint)
         END;
         mov(r, x);
         IF (x.r # NoReg) & (x.r # r) THEN FreeReg(x.r) END
       ELSIF x.mode IN {RegX, RegY} THEN
-        IF (x.r # NoReg) & ~(x.r IN usedRegs) OR (x.index # NoReg) & ~(x.index IN usedRegs) THEN
-          ORS.Mark("load error")
-        END;
         IF (x.r # NoReg) & ~(x.r IN reservedRegs) & ((x.r IN hint) OR (hint - usedRegs = {})) THEN r := x.r
         ELSIF (x.index # NoReg) & ~(x.index IN reservedRegs) & ((x.index IN hint) OR (hint - usedRegs = {})) THEN r := x.index
         ELSE r := GetReg(hint)
@@ -585,14 +573,10 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     VAR reg: INTEGER;
   BEGIN
     IF x.mode IN {RegI, RegJ} THEN
-      IF (x.r # NoReg) & ~(x.r IN usedRegs) THEN ORS.Mark("loadAdr error") END;
       IF (x.r # NoReg) & ~(x.r IN reservedRegs) & ((x.r IN hint) OR (hint - usedRegs = {})) THEN reg := x.r ELSE reg := GetReg(hint) END;
       lea(reg, x);
       IF (x.r # NoReg) & (x.r # reg) THEN FreeReg(x.r) END
     ELSIF x.mode IN {RegX, RegY} THEN
-      IF (x.r # NoReg) & ~(x.r IN usedRegs) OR (x.index # NoReg) & ~(x.index IN usedRegs) THEN
-        ORS.Mark("load error")
-      END;
       IF (x.r # NoReg) & ~(x.r IN reservedRegs) & ((x.r IN hint) OR (hint - usedRegs = {})) THEN reg := x.r
       ELSIF (x.index # NoReg) & ~(x.index IN reservedRegs) & ((x.index IN hint) OR (hint - usedRegs = {})) THEN reg := x.index
       ELSE reg := GetReg(hint)
