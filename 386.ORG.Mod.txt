@@ -363,6 +363,30 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     RETURN L1
   END merged;
 
+  PROCEDURE GenJmpLink (cond, next: INTEGER; VAR link: INTEGER);
+  BEGIN
+    IF cond # ccFalse THEN
+      IF cond = ccTrue THEN Gen1(JmpD32) ELSE Gen1(JccD32 + cond) END;
+      link := pc; GenWord(next)
+    ELSE link := next
+    END
+  END GenJmpLink;
+
+  PROCEDURE GenJmp (cond, L: INTEGER);
+    VAR disp: INTEGER;
+  BEGIN
+    IF cond # ccFalse THEN
+      disp := L - (pc + 2);
+      IF (disp >= -128) & (disp <= 127) THEN
+        IF cond = ccTrue THEN Gen1(JmpD8) ELSE Gen1(JccD8 + cond) END;
+        GenByte(disp)
+      ELSE
+        IF cond = ccTrue THEN Gen1(JmpD32) ELSE Gen1(JccD32 + cond) END;
+        GenWord(L - (pc + 4))
+      END
+    END
+  END GenJmp;
+
   (* loading of operands and addresses into registers *)
 
   PROCEDURE Gen4fixup (op, subop, scale, index, base, offset, fixup, mno, vno: INTEGER);
@@ -1089,16 +1113,9 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   END Not;
 
   PROCEDURE And1*(VAR x: Item);   (* x := x & *)
-    VAR cond: INTEGER;
   BEGIN
     IF x.mode # Cond THEN loadCond(x) END ;
-    cond := negated(x.r);
-    IF cond # ccTrue THEN
-      IF cond = ccFalse THEN Gen1word(JmpD32, x.a); x.a := pc - 4 (* jmp rel32 *)
-      ELSIF cond IN {0..15} THEN Gen1word(JccD32 + cond, x.a); x.a := pc - 4 (* jcc rel32 *)
-      ELSE ORS.Mark("invalid cc")
-      END
-    END;
+    GenJmpLink(negated(x.r), x.a, x.a);
     FixLink(x.b); x.b := 0
   END And1;
 
@@ -1109,16 +1126,9 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   END And2;
 
   PROCEDURE Or1*(VAR x: Item);   (* x := x OR *)
-    VAR cond: INTEGER;
   BEGIN
     IF x.mode # Cond THEN loadCond(x) END ;
-    cond := x.r;
-    IF cond # ccFalse THEN
-      IF cond = ccTrue THEN Gen1word(JmpD32, x.b); x.b := pc - 4 (* jmp rel32 *)
-      ELSIF cond IN {0..15} THEN Gen1word(JccD32 + cond, x.b); x.b := pc - 4 (* jcc rel32 *)
-      ELSE ORS.Mark("invalid cc")
-      END
-    END;
+    GenJmpLink(x.r, x.b, x.b);
     FixLink(x.a); x.a := 0
   END Or1;
 
@@ -1606,7 +1616,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     ELSE ORS.Mark("zero increment"); op := ORS.lss
     END;
     Compare(y, z, op, {AX}, regs); FreeItem(z);
-    Gen1(JccD32 + relmap[op - ORS.eql]); L := pc; GenWord(0);
+    GenJmpLink(relmap[op - ORS.eql], 0, L);
     Store(x, y)
   END For1;
 
@@ -1631,42 +1641,24 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   END Here;
 
   PROCEDURE FJump*(VAR L: LONGINT);
-  BEGIN Gen1word(JmpD32, L); L := pc - 4
+  BEGIN GenJmpLink(ccTrue, L, L)
   END FJump;
 
   PROCEDURE CFJump*(VAR x: Item);
-    VAR cond: INTEGER;
   BEGIN
     IF x.mode # Cond THEN loadCond(x) END;
-    cond := negated(x.r);
-    IF cond # ccFalse THEN
-      IF cond = ccTrue THEN Gen1word(JmpD32, x.a); x.a := pc - 4 (* jmp rel32 *)
-      ELSIF cond IN {0..15} THEN Gen1word(JccD32 + cond, x.a); x.a := pc - 4 (* jcc rel32 *)
-      ELSE ORS.Mark("invalid cc")
-      END
-    END;
+    GenJmpLink(negated(x.r), x.a, x.a);
     FixLink(x.b)
   END CFJump;
 
   PROCEDURE BJump*(L: LONGINT);
-    VAR disp: INTEGER;
-  BEGIN disp := L - (pc + 2);
-    IF (disp >= -128) & (disp <= 127) THEN Gen1(JmpD8); GenByte(disp)
-    ELSE Gen1word(JmpD32, disp - 3)
-    END
+  BEGIN GenJmp(ccTrue, L)
   END BJump;
 
   PROCEDURE CBJump*(VAR x: Item; L: LONGINT);
-    VAR cond: INTEGER;
   BEGIN
     IF x.mode # Cond THEN loadCond(x) END;
-    cond := negated(x.r);
-    IF cond # ccFalse THEN
-      IF cond = ccTrue THEN Gen1(JmpD32); GenWord(L - (pc + 4)) (* jmp rel32 *)
-      ELSIF cond IN {0..15} THEN Gen1(JccD32 + cond); GenWord(L - (pc + 4)) (* jcc rel32 *)
-      ELSE ORS.Mark("invalid cc")
-      END
-    END;
+    GenJmp(negated(x.r), L);
     FixLink(x.b); FixLinkWith(x.a, L)
   END CBJump;
 
@@ -1822,12 +1814,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   BEGIN
     IF x.mode # Cond THEN loadCond(x) END ;
     IF x.a = 0 THEN cond := negated(x.r)
-    ELSE
-      IF x.r # ccFalse THEN
-        IF x.r = ccTrue THEN Gen1word(JmpD32, x.b) ELSE Gen1word(JccD32 + x.r, x.b) END;
-        x.b := pc - 4
-      END;
-      FixLink(x.a); cond := ccTrue
+    ELSE GenJmpLink(x.r, x.b, x.b); FixLink(x.a); cond := ccTrue
     END ;
     Trap(cond, 7); FixLink(x.b)
   END Assert; 
