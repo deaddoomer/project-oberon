@@ -486,15 +486,17 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       ELSE Gen3v(op, r, x)
       END
     ELSIF x.mode = Cond THEN
-      IF x.r = ccTrue THEN
-        FixLink(x.b); FixLink(x.a); Gen1word(0B8H + r, 1) (* mov r,1 *)
-      ELSIF x.r = ccFalse THEN
-        FixLink(x.a); FixLink(x.b); Gen1word(0B8H + r, 0)  (* mov r,0 *)
-      ELSIF x.r IN {0..15} THEN
+      IF (x.r = ccTrue) OR (x.r = ccFalse) THEN
+        FixLink(x.a); FixLink(x.b);
+        IF x.r = ccTrue THEN op := 1 ELSE op := 0 END;
+        Gen1word(0B8H + r, op); (*mov r,imm32*)
+      ELSIF (x.a = 0) & (x.b = 0) THEN
+        Gen1word(0B8H + r, 0); (*mov r,0*)
+        Gen2(0F90H + x.r, 0, r) (*setcc r*)
+      ELSE
         Gen1(JccD8 + negated(x.r)); GenByte(7);
         FixLink(x.b); Gen1word(0B8H + r, 1); Gen1(JmpD8); GenByte(5);
         FixLink(x.a); Gen1word(0B8H + r, 0);
-      ELSE ORS.Mark("invalid cc")
       END
     ELSIF x.mode = FStk THEN
       Gen3(8DH, SP, SP, -4, anyoffset); (* lea esp,[esp-4] *)
@@ -1456,7 +1458,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   END StrToChar;
 
   PROCEDURE Store*(VAR x, y: Item); (* x := y *)
-    VAR op, r, offset, vno: LONGINT;
+    VAR op, r, offset, vno, pc0, pc1: LONGINT;
   BEGIN
     IF (y.mode = ORB.Const) & ((y.type.form # ORB.Proc) OR (x.type.size = 4)) THEN
       IF y.type.form = ORB.Proc THEN
@@ -1475,6 +1477,32 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       ELSE Gen3v(0DBH, 3, x) (* fistp dword[x] *)
       END;
       decF; FreeItem(x)
+    ELSIF y.mode = Cond THEN
+      IF (y.r = ccTrue) OR (y.r = ccFalse) THEN
+        FixLink(y.a); FixLink(y.b);
+        IF x.r = ccTrue THEN op := 1 ELSE op := 0 END;
+        IF x.type.size = 1 THEN Gen3v(0C6H, 0, x); GenByte(op) (*mov byte[x],imm8*)
+        ELSE Gen3v(0C7H, 0, x); GenWord(op) (*mov dword[x],imm32*)
+        END
+      ELSIF (y.a = 0) & (y.b = 0) THEN
+        IF x.type.size = 1 THEN Gen3v(0F90H + y.r, 0, x) (*setcc byte[x]*)
+        ELSE load(y, {AX}); Gen3v(89H, y.r, x) (*mov dword[x],y*)
+        END
+      ELSE
+        Gen1(JccD8 + negated(y.r)); pc0 := pc; GenByte(0);
+        FixLink(y.b); (*TRUE*)
+        IF x.type.size = 1 THEN Gen3v(0C6H, 0, x); GenByte(1) (*mov byte[x],imm8*)
+        ELSE  Gen3v(0C7H, 0, x); GenWord(1) (*mov dword[x],imm32*)
+        END;
+        Gen1(JmpD8); pc1 := pc; GenByte(0);
+        FixLink(y.a); (*FALSE*)
+        IF x.type.size = 1 THEN Gen3v(0C6H, 0, x); GenByte(0) (*mov byte[x],imm8*)
+        ELSE  Gen3v(0C7H, 0, x); GenWord(0) (*mov dword[x],imm32*)
+        END;
+        PutByte(pc0, pc - (pc0 + 1));
+        PutByte(pc1, pc - (pc1 + 1))
+      END;
+      FreeItem(x)
     ELSE load(y, {AX});
       IF (x.type.size = 1) & (y.r IN {SP..DI}) THEN (* must be AL, BL, CL, DL *)
         r := GetReg(regs - {SP..DI});
