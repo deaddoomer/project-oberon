@@ -1229,10 +1229,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       IF op = ORS.div THEN x.a := x.a DIV y.a ELSE x.a := x.a MOD y.a END
     ELSIF (y.mode = ORB.Const) & (y.a >= 2) & (log2(y.a, e) = 1) THEN
       IF op = ORS.div THEN y.a := e; shift(1, x, y, regs) (* sar x,y *)
-      ELSIF e <= 16 THEN y.a := y.a-1; sop(ORS.times, x, y, regs) (* and x,(y-1) *)
-      ELSE
-        MakeConstItem(y, ORB.intType, 32 - e); shift(0, x, y, regs); (* shl x,y *)
-        MakeConstItem(y, ORB.intType, 32 - e); shift(2, x, y, regs); (* ror x,y *)
+      ELSE y.a := y.a-1; sop(ORS.times, x, y, regs) (*and x,(y-1)*)
       END
     ELSIF ~check & positive & (y.mode IN {ORB.Var, ORB.Par, RegI, RegJ, RegX, RegY}) THEN
       IF y.mode IN {RegI, RegJ, RegX, RegY} THEN
