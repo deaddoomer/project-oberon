@@ -436,6 +436,43 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     END;
   END Gen3v;
 
+  PROCEDURE movmem(VAR x: Item; r: INTEGER; freeReg: BOOLEAN);
+    VAR temp, offset, vno: INTEGER;
+  BEGIN
+    IF x.mode = Reg THEN
+      Gen3v(89H, r, x) (*mov x,r*)
+    ELSE
+      IF (x.type.size = 1) & (r IN {SP..DI}) THEN (*must be AL, BL, CL, DL*)
+        temp := GetReg({AX});
+        IF temp IN {SP..DI} THEN ORS.Mark("too many regs in use") END;
+        Gen2(8BH, temp, r);
+        IF freeReg THEN FreeReg(r) END;
+        r := temp; freeReg := TRUE
+      END;
+      IF x.mode IN {RegJ, RegY} THEN
+        PrepFixup(x.a, x.fixup, x.mno, x.vno, offset, vno)
+      END;
+      IF (r = AX) &
+        (x.mode IN {RegI, RegJ, RegX, RegY}) & (x.r = NoReg) &
+        (~(x.mode IN {RegX, RegY}) OR (x.index = NoReg) OR (x.scale = 0)) &
+        (~(x.mode IN {RegJ, RegY}) OR (offset = 0) OR (x.fixup = 0)) THEN
+        IF x.type.size = 1 THEN Gen1word(0A2H, x.a) ELSE Gen1word(0A3H, x.a) END; (*mov [x],eax*)
+        IF x.mode IN {RegJ, RegY} THEN Fix(x.fixup, x.mno, vno) END
+      ELSIF x.type.size = 1 THEN Gen3v(88H, r, x) (*mov byte[x],r*)
+      ELSE Gen3v(89H, r, x) (*mov dword[x],r*)
+      END
+    END;
+    IF freeReg THEN FreeReg(r) END
+  END movmem;
+
+  PROCEDURE movmemcon(VAR x: Item; val: INTEGER);
+  BEGIN
+    IF x.mode = Reg THEN Gen1word(0B8H + x.r, val) (*mov x,imm32*)
+    ELSIF x.type.size = 1 THEN Gen3v(0C6H, 0, x); GenByte(val) (*mov byte[x],imm8*)
+    ELSE Gen3v(0C7H, 0, x); GenWord(val) (*mov dword[x],imm32*)
+    END
+  END movmemcon;
+
   PROCEDURE mov(r: INTEGER; VAR x: Item);
     VAR op, offset, vno: INTEGER;
   BEGIN
@@ -563,6 +600,21 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     END
   END lea;
 
+  PROCEDURE simplify(VAR x: Item);
+  BEGIN
+    IF x.mode = ORB.Var THEN
+      IF x.r > 0 THEN x.mode := RegI; x.r := BP
+      ELSE
+        x.fixup := FixVar; x.mno := x.r; x.vno := x.a;
+        x.mode := RegJ; x.r := NoReg; x.a := 0
+      END
+    ELSIF x.mode = RegJ THEN
+      IF x.fixup = 0 THEN x.mode := RegI END
+    ELSIF x.mode = RegY THEN
+      IF x.fixup = 0 THEN x.mode := RegX END
+    END
+  END simplify;
+
   PROCEDURE load(VAR x: Item; hint: SET);
     VAR r: LONGINT;
   BEGIN
@@ -572,15 +624,15 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
         ELSE r := GetReg(hint)
         END;
         mov(r, x);
-        IF (x.r # NoReg) & (x.r # r) THEN FreeReg(x.r) END
+        IF (x.r # NoReg) & (x.r # r) & ~(x.r IN reservedRegs) THEN FreeReg(x.r) END
       ELSIF x.mode IN {RegX, RegY} THEN
         IF (x.r # NoReg) & ~(x.r IN reservedRegs) & ((x.r IN hint) OR (hint - usedRegs = {})) THEN r := x.r
         ELSIF (x.index # NoReg) & ~(x.index IN reservedRegs) & ((x.index IN hint) OR (hint - usedRegs = {})) THEN r := x.index
         ELSE r := GetReg(hint)
         END;
         mov(r, x);
-        IF (x.r # NoReg) & (x.r = r) THEN FreeReg(x.index) END;
-        IF (x.index # NoReg) & (x.index = r) THEN FreeReg(x.r) END
+        IF (x.r # NoReg) & (x.r = r) & ~(x.index IN reservedRegs) THEN FreeReg(x.index) END;
+        IF (x.index # NoReg) & (x.index = r) & ~(x.r IN reservedRegs) THEN FreeReg(x.r) END
       ELSIF x.mode =  FStk THEN
         r := GetReg(hint);
         Gen3(8DH, SP, SP, -4, anyoffset); (* lea esp,[esp-4] *)
@@ -601,15 +653,15 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     IF x.mode IN {RegI, RegJ} THEN
       IF (x.r # NoReg) & ~(x.r IN reservedRegs) & ((x.r IN hint) OR (hint - usedRegs = {})) THEN reg := x.r ELSE reg := GetReg(hint) END;
       lea(reg, x);
-      IF (x.r # NoReg) & (x.r # reg) THEN FreeReg(x.r) END
+      IF (x.r # NoReg) & (x.r # reg) & ~(x.r IN reservedRegs) THEN FreeReg(x.r) END
     ELSIF x.mode IN {RegX, RegY} THEN
       IF (x.r # NoReg) & ~(x.r IN reservedRegs) & ((x.r IN hint) OR (hint - usedRegs = {})) THEN reg := x.r
       ELSIF (x.index # NoReg) & ~(x.index IN reservedRegs) & ((x.index IN hint) OR (hint - usedRegs = {})) THEN reg := x.index
       ELSE reg := GetReg(hint)
       END;
       lea(reg, x);
-      IF (x.r # NoReg) & (x.r = reg) THEN FreeReg(x.index) END;
-      IF (x.index # NoReg) & (x.index = reg) THEN FreeReg(x.r) END
+      IF (x.r # NoReg) & (x.r = reg) & ~(x.index IN reservedRegs) THEN FreeReg(x.index) END;
+      IF (x.index # NoReg) & (x.index = reg) & ~(x.r IN reservedRegs) THEN FreeReg(x.r) END
     ELSIF x.mode # Reg THEN
       reg := GetReg(hint); lea(reg, x)
     ELSE ORS.Mark("address error"); reg := AX
@@ -984,9 +1036,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   BEGIN;
     IF x.mode = ORB.Var THEN
       IF x.r >= 0 THEN x.a := x.a + y.val
-      ELSIF (x.mode = ORB.Var) & (x.r <= 0) THEN
-        x.fixup := FixVar; x.mno := x.r; x.vno := x.a;
-        x.mode := RegJ; x.r := NoReg; x.a := y.val
+      ELSIF x.mode = ORB.Var THEN simplify(x); x.a := x.a + y.val
       ELSE loadAdr(x, regs); x.mode := RegI; x.a := y.val
       END
     ELSIF x.mode IN {RegI, RegJ, RegX, RegY} THEN x.a := x.a + y.val
@@ -1458,72 +1508,41 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   END StrToChar;
 
   PROCEDURE Store*(VAR x, y: Item); (* x := y *)
-    VAR op, r, offset, vno, pc0, pc1: LONGINT;
+    VAR r, offset, vno, pc0, pc1: LONGINT;
   BEGIN
+    simplify(x); simplify(y);
     IF (y.mode = ORB.Const) & ((y.type.form # ORB.Proc) OR (x.type.size = 4)) THEN
       IF y.type.form = ORB.Proc THEN
         PrepFixup(0, FixCode, y.r, y.a, offset, vno);
-        IF offset = 0 THEN Gen3v(0C7H, 0, x); GenWord(0); Fix(FixCode, y.r, vno) (*mov [x],imm*)
-        ELSE r := GetReg(regs); mov(r, y); Gen3v(89H, r, x); FreeReg(r) (*mov [x],r*)
+        IF (x.type.size = 4) & (offset = 0) THEN movmemcon(x, 0); Fix(FixCode, y.r, vno) (*mov [x],imm*)
+        ELSE r := GetReg(regs); mov(r, y); movmem(x, r, TRUE) (*mov [x],r*)
         END
-      ELSIF x.type.size = 1 THEN
-        Gen3v(0C6H, 0, x); GenByte(y.a) (*mov byte[x],imm8*)
-      ELSE
-        Gen3v(0C7H, 0, x); GenWord(y.a) (*mov dword[x],imm32*)
-      END;
-      FreeItem(x)
+      ELSE movmemcon(x, y.a)
+      END
     ELSIF (y.mode = FStk) & (x.type.size = 4) THEN
       IF x.type.form = ORB.Real THEN Gen3v(0D9H, 3, x) (* fstp float32[x] *)
       ELSE Gen3v(0DBH, 3, x) (* fistp dword[x] *)
       END;
-      decF; FreeItem(x)
+      decF
     ELSIF y.mode = Cond THEN
       IF (y.r = ccTrue) OR (y.r = ccFalse) THEN
         FixLink(y.a); FixLink(y.b);
-        IF x.r = ccTrue THEN op := 1 ELSE op := 0 END;
-        IF x.type.size = 1 THEN Gen3v(0C6H, 0, x); GenByte(op) (*mov byte[x],imm8*)
-        ELSE Gen3v(0C7H, 0, x); GenWord(op) (*mov dword[x],imm32*)
-        END
+        IF x.r = ccTrue THEN movmemcon(x, 1) ELSE movmemcon(x, 0) END;
       ELSIF (y.a = 0) & (y.b = 0) THEN
         IF x.type.size = 1 THEN Gen3v(0F90H + y.r, 0, x) (*setcc byte[x]*)
-        ELSE load(y, {AX}); Gen3v(89H, y.r, x) (*mov dword[x],y*)
+        ELSE load(y, regs); movmem(x, y.r, TRUE) (*mov dword[x],y*)
         END
       ELSE
         Gen1(JccD8 + negated(y.r)); pc0 := pc; GenByte(0);
-        FixLink(y.b); (*TRUE*)
-        IF x.type.size = 1 THEN Gen3v(0C6H, 0, x); GenByte(1) (*mov byte[x],imm8*)
-        ELSE  Gen3v(0C7H, 0, x); GenWord(1) (*mov dword[x],imm32*)
-        END;
+        FixLink(y.b); movmemcon(x, 1);
         Gen1(JmpD8); pc1 := pc; GenByte(0);
-        FixLink(y.a); (*FALSE*)
-        IF x.type.size = 1 THEN Gen3v(0C6H, 0, x); GenByte(0) (*mov byte[x],imm8*)
-        ELSE  Gen3v(0C7H, 0, x); GenWord(0) (*mov dword[x],imm32*)
-        END;
         PutByte(pc0, pc - (pc0 + 1));
+        FixLink(y.a); movmemcon(x, 0);
         PutByte(pc1, pc - (pc1 + 1))
-      END;
-      FreeItem(x)
-    ELSE load(y, {AX});
-      IF (x.type.size = 1) & (y.r IN {SP..DI}) THEN (* must be AL, BL, CL, DL *)
-        r := GetReg(regs - {SP..DI});
-        IF r IN {SP..DI} THEN ORS.Mark("too many regs in use") END;
-        mov(r, y); FreeReg(y.r); y.r := r
-      END;
-      IF (x.mode = ORB.Var) & (x.r <= 0) & (y.r = AX) THEN (* mov [x],eax *)
-        PrepFixup(0, FixVar, x.r, x.a, offset, vno);
-        IF offset = 0 THEN
-          IF x.type.size = 1 THEN Gen1word(0A2H, 0) ELSE Gen1word(0A3H, 0) END;
-          Fix(FixVar, x.r, vno)
-        ELSIF x.type.size = 1 THEN
-           Gen3v(88H, y.r, x) (*mov byte[x],y*)
-        ELSE
-          Gen3v(89H, y.r, x) (*mov dword[x],y*)
-        END
-      ELSIF x.type.size = 1 THEN Gen3v(88H, y.r, x) (* mov byte[x],y *)
-      ELSE Gen3v(89H, y.r, x) (* mov dword[x],y *)
-      END;
-      FreeItem(y); FreeItem(x)
-    END
+      END
+    ELSE load(y, {AX}); movmem(x, y.r, TRUE)
+    END;
+    FreeItem(x)
   END Store;
 
   PROCEDURE StoreStruct*(VAR x, y: Item); (* x := y, frame = 0 *)
