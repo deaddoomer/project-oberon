@@ -110,8 +110,30 @@ MODULE Input; (*NW 5.10.86 / 15.11.90 Ceres-2; PDR 21.4.12 / NW 15.5.2013 Ceres-
   END Decimal;
 
   PROCEDURE Init*;
-    VAR i, fd, res: INTEGER; name: ARRAY 32 OF CHAR; events: SET;
+    VAR i, j, k, fd, res, key: INTEGER;
+      name: ARRAY 32 OF CHAR;
+      events: SET;
+      ok: BOOLEAN;
+      keys: ARRAY 8 OF SET;
+      ch: CHAR;
   BEGIN Up := FALSE; Shift := FALSE; Ctrl := FALSE; Recd := FALSE;
+    KTabAdr := SYSTEM.ADR($
+      00 1B 31 32 33 34 35 36  37 38 39 30 2D 3D 08 09
+      71 77 65 72 74 79 75 69  6F 70 5B 5D 0D 00 61 73
+      64 66 67 68 6A 6B 6C 3B  27 60 00 5C 7A 78 63 76
+      62 6E 6D 2C 2E 2F 00 00  00 20 00 1A 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 7F 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 1B 21 40 23 24 25 5E  26 2A 28 29 5F 2B 08 09
+      51 57 45 52 54 59 55 49  4F 50 7B 7D 0D 00 41 53
+      44 46 47 48 4A 4B 4C 3A  22 7E 00 7C 5A 58 43 56
+      42 4E 4D 3C 3E 3F 00 00  00 20 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 7F 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00$);
     SYSTEM.PUT(SYSTEM.ADR(syscall2), SYSTEM.ADR($8B442408 8B5C2404 CD80 C20800 6690 90$));
     SYSTEM.PUT(SYSTEM.ADR(syscall4), SYSTEM.ADR($8B442410 8B5C240C 8B4C2408 8B542404 CD80 C21000 6690 90$));
     FOR i := 0 TO MN-1 DO res := syscall2(6, ms[i]) END; (*close*)
@@ -122,9 +144,24 @@ MODULE Input; (*NW 5.10.86 / 15.11.90 Ceres-2; PDR 21.4.12 / NW 15.5.2013 Ceres-
       REPEAT (*open(name, O_NONBLOCK|O_RDONLY)*)
         fd := syscall4(5, SYSTEM.ADR(name), 800H, 0)
       UNTIL fd # -4;
-      IF fd >= 0 THEN (*ioctl(fd, EVIOCGBIT(0, 4), &events)*)
-        res := syscall4(54, fd, 80044520H, SYSTEM.ADR(events));
-        IF (res >= 0) & (1 IN events) THEN kbd[KN] := fd; INC(KN)
+      IF fd >= 0 THEN
+        ok := FALSE;
+        IF syscall4(54, fd, 80044520H, SYSTEM.ADR(events)) > 0 THEN (*ioctl(fd, EVIOCGBIT(0, 4), &events)*)
+          IF 1 IN events THEN
+            res := syscall4(54, fd, 80204521H, SYSTEM.ADR(keys)); (*ioctl(fd, EVIOCGBIT(EV_KEY, 32), keys)*)
+            IF res > 0 THEN
+              j := 0;
+              REPEAT (*at least one key must be supported by keyboard*)
+                key := j MOD 128;
+                IF key < res * 4 THEN
+                  SYSTEM.GET(KTabAdr + j, ch); ok := (ch # 0X) & ((key MOD 32) IN keys[key DIV 32])
+                END;
+                INC(j)
+              UNTIL ok OR (j >= 256)
+            END
+          END
+        END;
+        IF ok THEN kbd[KN] := fd; INC(KN)
         ELSE res := syscall2(6, fd) (*close*)
         END
       END;
@@ -144,24 +181,7 @@ MODULE Input; (*NW 5.10.86 / 15.11.90 Ceres-2; PDR 21.4.12 / NW 15.5.2013 Ceres-
       REPEAT res := syscall4(4, 2, SYSTEM.ADR($0A$), 1) UNTIL res # -4;
       Host.Abort
     END;
-    Host.Init({0});
-    KTabAdr := SYSTEM.ADR($
-      00 1B 31 32 33 34 35 36  37 38 39 30 2D 3D 08 09
-      71 77 65 72 74 79 75 69  6F 70 5B 5D 0D 00 61 73
-      64 66 67 68 6A 6B 6C 3B  27 60 00 5C 7A 78 63 76
-      62 6E 6D 2C 2E 2F 00 00  00 20 00 1A 00 00 00 00
-      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
-      00 00 00 7F 00 00 00 00  00 00 00 00 00 00 00 00
-      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
-      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
-      00 1B 21 40 23 24 25 5E  26 2A 28 29 5F 2B 08 09
-      51 57 45 52 54 59 55 49  4F 50 7B 7D 0D 00 41 53
-      44 46 47 48 4A 4B 4C 3A  22 7E 00 7C 5A 58 43 56
-      42 4E 4D 3C 3E 3F 00 00  00 20 00 00 00 00 00 00
-      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
-      00 00 00 7F 00 00 00 00  00 00 00 00 00 00 00 00
-      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
-      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00$)
+    Host.Init({0})
   END Init;
 
 BEGIN Init
