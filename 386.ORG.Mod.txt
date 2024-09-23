@@ -1920,7 +1920,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
 
   PROCEDURE Copy*(VAR x, y, z: Item);
     VAR saveCX, saveSI, saveDI, pc0, cond: INTEGER; w: Item;
-  BEGIN load(x, {DI}); load(y, {SI}); pc0 := 0;
+  BEGIN load(x, {SI}); load(y, {DI}); pc0 := 0;
     IF z.mode = ORB.Const THEN
       IF z.a <= 0 THEN ORS.Mark("bad count") END;
       load(z, {CX})
