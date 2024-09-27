@@ -46,6 +46,7 @@ MODULE Host; (*kolibrios*)
     GetKey: PROCEDURE (): INTEGER; (*fn2*)
     WaitEvent: PROCEDURE (): INTEGER; (*fn10*)
     CheckEvent: PROCEDURE (): INTEGER; (*fn11*)
+    ClearButtons: PROCEDURE; (*fn12.1*)
     FinishRepaint: PROCEDURE; (*fn12.2*)
     GetButton: PROCEDURE (): INTEGER; (*fn17*)
     WaitEventTime: PROCEDURE (t: INTEGER): INTEGER; (*fn23*)
@@ -104,6 +105,7 @@ MODULE Host; (*kolibrios*)
   PROCEDURE Repaint*(x, y, w, h: INTEGER);
     VAR par: BlitPar; winx, winy, winw, winh, Y: INTEGER;
   BEGIN
+    ClearButtons; (*bug: must present, otherwise window may lock whole host os*)
     IF valid & (w > 0) & (h > 0) THEN
       Y := Height - y - h;
       winw := Width + frame*2 - 1;
@@ -196,6 +198,7 @@ BEGIN
   SYSTEM.PUT(SYSTEM.ADR(GetKey), SYSTEM.ADR($B802000000 CD40 C3$));
   SYSTEM.PUT(SYSTEM.ADR(WaitEvent), SYSTEM.ADR($B80A000000 CD40 C3$));
   SYSTEM.PUT(SYSTEM.ADR(CheckEvent), SYSTEM.ADR($B80B000000 CD40 C3$));
+  SYSTEM.PUT(SYSTEM.ADR(ClearButtons), SYSTEM.ADR($B80C000000 BB01000000 CD40 C3 6690 90$));
   SYSTEM.PUT(SYSTEM.ADR(FinishRepaint), SYSTEM.ADR($B80C000000 BB02000000 CD40 C3 6690 90$));
   SYSTEM.PUT(SYSTEM.ADR(GetButton), SYSTEM.ADR($B811000000 CD40 C3$));
   SYSTEM.PUT(SYSTEM.ADR(WaitEventTime), SYSTEM.ADR($55 89E5 B817000000 8B5C2408 CD40 C3 5D C20400 90$));
