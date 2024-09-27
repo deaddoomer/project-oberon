@@ -54,7 +54,11 @@ MODULE Display;  (*NW 5.11.2013 / 17.1.2019*)
   PROCEDURE CopyPattern*(col, patadr, x, y, mode: INTEGER);  (*only for modes = paint, invert*)
     VAR w, h, b: BYTE; i, j, a, c, end, step, line, w0, w1, w11, w4: INTEGER; u, s: SET;
   BEGIN SYSTEM.GET(patadr, w); SYSTEM.GET(patadr + 1, h); INC(patadr, 2);
-    IF y + h > Height THEN h := -Height + h + y END; (*hack*)
+    IF x < 0 THEN x := 0 END; (*hack*)
+    IF y + h >= Height THEN (*hack*)
+      h := Height - y;
+      IF h < 0 THEN h := 0 END;
+   END;
     a := Base + (Height - 1 - y + yoff) * stride + (x + xoff)*4;
     line := (w + 7) DIV 8 * 8; w4 := w DIV 32; w1 := (w - w4*32) DIV 8; w11 := w1 * 8; w0 := w - w4*32 - w1*8;
     step := stride + line*4 - (line - w)*4; end := patadr + (line * h) DIV 8;
