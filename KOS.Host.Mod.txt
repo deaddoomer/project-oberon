@@ -1,0 +1,211 @@
+MODULE Host; (*kolibrios*)
+  IMPORT SYSTEM, Kernel, FileDir, Files;
+
+  CONST
+    default* = 0; (*default cursor*)
+    frame* = 5; (*window frame size*)
+
+  TYPE
+    BlitPar = RECORD
+      dx, dy, dw, dh: INTEGER;
+      sl, st, sr, sb: INTEGER; (*w = sr - sl; h = sb - st*)
+      bitmap, row: INTEGER
+    END;
+
+    Cursor = POINTER TO CursorDesc;
+    CursorDesc = RECORD
+      bitmap: ARRAY 32, 32 OF INTEGER (*[y,x]=argb*)
+    END;
+
+    FilePar =
+      RECORD
+        fn, offset, flags, size, data, enc, path: INTEGER
+      END ;
+
+    FileAttr =
+      RECORD
+        attr: SET;
+        enc: INTEGER;
+        ctime, cdate, atime, adate, mtime, mdate: ARRAY 4 OF BYTE;
+        loSize, hiSize: INTEGER;
+        (*name: ARRAY 520 OF CHAR*)
+      END ;
+
+    Handler* = PROCEDURE (ev: INTEGER; VAR continue: BOOLEAN);
+
+  VAR
+    Base*, Width*, Height*, Stretch*: INTEGER;
+    maxw*, maxh*: INTEGER; (*recommended framebuffer size*)
+    hidden*: INTEGER; (*cursor handle*)
+    handle*: ARRAY 32 OF Handler; (*event handlers*)
+    scrx, scry, scrw, scrh, skinh: INTEGER; (*display work area, skin header size*)
+    valid: BOOLEAN; (*framebuffer state*)
+
+    Terminate: PROCEDURE; (*fn-1*)
+    DefineWindow: PROCEDURE (xw, yh, style, hstyle: INTEGER; caption: ARRAY OF CHAR); (*fn0*)
+    GetKey: PROCEDURE (): INTEGER; (*fn2*)
+    WaitEvent: PROCEDURE (): INTEGER; (*fn10*)
+    CheckEvent: PROCEDURE (): INTEGER; (*fn11*)
+    FinishRepaint: PROCEDURE; (*fn12.2*)
+    GetButton: PROCEDURE (): INTEGER; (*fn17*)
+    WaitEventTime: PROCEDURE (t: INTEGER): INTEGER; (*fn23*)
+    GetMouseWinCoords: PROCEDURE (): INTEGER; (*fn37.1*)
+    LoadCursor: PROCEDURE (data, mode: INTEGER): INTEGER; (*fn37.4*)
+    InstallCursor: PROCEDURE (handle: INTEGER): INTEGER; (*fn37.5*)
+    GetSkinHeight: PROCEDURE (): INTEGER; (*fn48.4*)
+    GetScreenWorkArea: PROCEDURE (VAR lr, tb: INTEGER); (*fn48.5*)
+    DrawImageWithPal: PROCEDURE (bitmap, wh, xy, bpp, pal, row: INTEGER); (*fn65*)
+    Blit: PROCEDURE (op: INTEGER; par: BlitPar); (*fn73*)
+    FileCall: PROCEDURE (f: FilePar; VAR count: INTEGER): INTEGER; (*fn80*)
+
+  PROCEDURE Exit*;
+  BEGIN
+    Kernel.Install(SYSTEM.ADR(Terminate), 20H); (*terminate immediately on trap*)
+    Kernel.Install(SYSTEM.ADR(Terminate), 0); (*terminate immediately on abort*)
+    Files.RestoreList; (*delete temp files*)
+    Terminate
+  END Exit;
+
+  PROCEDURE BCDToClock (t, d: ARRAY OF BYTE): INTEGER;
+  BEGIN RETURN ORD((((((d[3] * 256 + d[2]) MOD 100 * 10H + d[1])*20H + d[0])*20H + t[2])*40H + t[1])*40H + t[0])
+  END BCDToClock;
+
+  PROCEDURE Check(s: ARRAY OF CHAR): INTEGER;
+    VAR i, res: INTEGER; ch: CHAR;
+  BEGIN ch := s[0]; i := 0;
+    IF (ch >= "A") & (ch <= "Z") OR (ch >= "a") & (ch <= "z") THEN
+      REPEAT INC(i); ch := s[i]
+      UNTIL ~((ch >= "0") & (ch <= "9") OR (ch >= "A") & (ch <= "Z")
+        OR (ch >= "a") & (ch <= "z") OR (ch = ".")) OR (i = FileDir.FnLength);
+      IF i = FileDir.FnLength THEN res := 4
+      ELSIF ch = 0X THEN res := 0;
+        WHILE i < FileDir.FnLength DO INC(i) END
+      ELSE res := 5
+      END
+    ELSIF ch = 0X THEN res := -1
+    ELSE res := 3
+    END;
+    RETURN res
+  END Check;
+
+  PROCEDURE FileInfo*(name: ARRAY OF CHAR; VAR len, date: INTEGER);
+    VAR res, count: INTEGER; par: FilePar; info: FileAttr;
+  BEGIN len := -1; date := 0;
+    IF Check(name) = 0 THEN
+      par.fn := 5; par.offset := 0; par.flags := 0; par.size := 0; par.data := SYSTEM.ADR(info);
+      par.enc := 3; par.path := SYSTEM.ADR(name);
+      res := FileCall(par, count);
+      IF (res = 0) & (info.attr * {3, 4} = {}) & (info.hiSize = 0) & (info.loSize >= 0) THEN (*not label, not folder*)
+        len := info.loSize; date := BCDToClock(info.ctime, info.cdate)
+      END
+    END
+  END FileInfo;
+
+  PROCEDURE Repaint*(x, y, w, h: INTEGER);
+    VAR par: BlitPar; winx, winy, winw, winh, Y: INTEGER;
+  BEGIN
+    IF valid & (w > 0) & (h > 0) THEN
+      Y := Height - y - h;
+      winw := Width + frame*2 - 1;
+      winh := Height + skinh + frame - 1;
+      winx := scrx + scrw DIV 2 - (winw + 1) DIV 2;
+      winy := scry + scrh DIV 2 - (winh + 1) DIV 2;
+      IF winx < 0 THEN winx := 0 END;
+      IF winy < 0 THEN winy := 0 END;
+      DefineWindow(winx * 65536 + winw, winy * 65536 + winh, 74000000H, 0, "Oberon");
+      (*blit partial*)
+      par.dx := x; par.dy := Y; par.dw := Width - x; par.dh := Height - Y;
+      par.sl := x; par.st := Y; par.sr := x + w; par.sb := Y + h;
+      par.bitmap := Base; par.row := Stretch;
+      Blit(20000000H, par);
+      (*blit full*)
+      (*par.dx := 0; par.dy := 0; par.dw := Width; par.dh := Height;
+      par.sl := 0; par.st := 0; par.sr := Width; par.sb := Height;
+      par.bitmap := Base; par.row := Stretch;
+      Blit(20000000H, par);*)
+      (*draw partial*)
+      (*DrawImageWithPal(Base + Y*Stretch + x*4, w * 65536 + h, x * 65536 + Y, 32, 0, Stretch - w*4);*)
+      (*draw full*)
+      (*DrawImageWithPal(Base, Width * 65536 + Height, 0, 32, 0, Stretch - Width*4);*)
+    END;
+    FinishRepaint
+  END Repaint;
+
+  PROCEDURE UpdateVars;
+    VAR lr, tb: INTEGER;
+  BEGIN
+    GetScreenWorkArea(lr, tb);
+    scrx := lr DIV 65536 MOD 65536;
+    scrw := lr MOD 65536 - scrx + 1;
+    scry := tb DIV 65536 MOD 65536;
+    scrh := tb MOD 65536 - scry + 1;
+    skinh := GetSkinHeight();
+    maxw := scrw - frame*2;
+    maxh := scrh - frame - skinh
+  END UpdateVars;
+
+  PROCEDURE HandleEvents*(wait: INTEGER; skip: BOOLEAN);
+    VAR event, temp: INTEGER; continue: BOOLEAN; p: Handler;
+  BEGIN
+    continue := TRUE;
+    REPEAT
+      IF wait = 0 THEN event := CheckEvent()
+      ELSIF wait < 0 THEN event := WaitEvent()
+      ELSE event := WaitEventTime(wait)
+      END;
+      IF event = 1 THEN UpdateVars END;
+      p := handle[event];
+      IF p # NIL THEN
+        continue := FALSE;
+        p(event, continue)
+      ELSIF skip THEN
+        continue := TRUE;
+        IF event = 1 THEN Repaint(0, 0, Width, Height)
+        ELSIF event = 2 THEN temp := GetKey()
+        ELSIF event = 3 THEN temp := GetButton()
+        ELSIF event = 5 THEN Repaint(0, 0, Width, Height)
+        ELSIF event = 6 THEN temp := GetMouseWinCoords()
+        ELSE continue := FALSE
+        END
+      ELSE continue := FALSE
+      END
+    UNTIL ~continue
+  END HandleEvents;
+
+  PROCEDURE SetBuffer*(base, w, h, stretch, bpp: INTEGER);
+  BEGIN
+    Base := base; Width := w; Height := h; Stretch := stretch;
+    valid := (base # 0) & (w > 0) & (h > 0) & (stretch > 0) & (bpp > 0);
+    Repaint(0, 0, Width, Height)
+  END SetBuffer;
+
+  PROCEDURE SetHandler*(ev: INTEGER; h: Handler);
+  BEGIN handle[ev] := h
+  END SetHandler;
+
+  PROCEDURE Init;
+    VAR c: Cursor;
+  BEGIN
+    NEW(c); hidden := LoadCursor(SYSTEM.ADR(c.bitmap), 2);
+    UpdateVars
+  END Init;
+
+BEGIN
+  SYSTEM.PUT(SYSTEM.ADR(Terminate), SYSTEM.ADR($B8FFFFFFFF CD40$));
+  SYSTEM.PUT(SYSTEM.ADR(DefineWindow), SYSTEM.ADR($55 89E5 B800000000 8B5D1C 8B4D18 8B5514 8B7510 8B7D0C CD40 5D C21800 6690 90$));
+  SYSTEM.PUT(SYSTEM.ADR(GetKey), SYSTEM.ADR($B802000000 CD40 C3$));
+  SYSTEM.PUT(SYSTEM.ADR(WaitEvent), SYSTEM.ADR($B80A000000 CD40 C3$));
+  SYSTEM.PUT(SYSTEM.ADR(CheckEvent), SYSTEM.ADR($B80B000000 CD40 C3$));
+  SYSTEM.PUT(SYSTEM.ADR(FinishRepaint), SYSTEM.ADR($B80C000000 BB02000000 CD40 C3 6690 90$));
+  SYSTEM.PUT(SYSTEM.ADR(GetButton), SYSTEM.ADR($B811000000 CD40 C3$));
+  SYSTEM.PUT(SYSTEM.ADR(WaitEventTime), SYSTEM.ADR($55 89E5 B817000000 8B5C2408 CD40 C3 5D C20400 90$));
+  SYSTEM.PUT(SYSTEM.ADR(GetMouseWinCoords), SYSTEM.ADR($B825000000 BB01000000 CD40 C3 6690 90$));
+  SYSTEM.PUT(SYSTEM.ADR(LoadCursor), SYSTEM.ADR($55 89E5 B825000000 BB04000000 8B4D0C 8B5508 CD40 5D C20800 6690 90$));
+  SYSTEM.PUT(SYSTEM.ADR(InstallCursor), SYSTEM.ADR($55 89E5 B825000000 BB05000000 8B4D08 CD40 5D C20400 6690 90$));
+  SYSTEM.PUT(SYSTEM.ADR(GetSkinHeight), SYSTEM.ADR($B830000000 BB04000000 CD40 C3 6690 90$));
+  SYSTEM.PUT(SYSTEM.ADR(GetScreenWorkArea), SYSTEM.ADR($55 89E5 B830000000 BB05000000 CD40 8B4D08 8919 8B4D0C 8901 5D C20800 6690 90$));
+  SYSTEM.PUT(SYSTEM.ADR(DrawImageWithPal), SYSTEM.ADR($55 89E5 B841000000 8B5D1C 8B4D18 8B5514 8B7510 8B7D0C 8B6D08 CD40 5D C21800$));
+  SYSTEM.PUT(SYSTEM.ADR(Blit), SYSTEM.ADR($55 89E5 B849000000 8B5D10 8B4D0C CD40 5D C20C00$));
+  SYSTEM.PUT(SYSTEM.ADR(FileCall), SYSTEM.ADR($55 89E5 B850000000 8B5D10 CD40 8B4D08 8919 5D C20C00 6690$));
+  Init;
+END Host.

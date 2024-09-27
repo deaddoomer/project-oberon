@@ -1,0 +1,176 @@
+MODULE Input; (*NW 5.10.86 / 15.11.90 Ceres-2; PDR 21.4.12 / NW 15.5.2013 Ceres-4*)
+  IMPORT SYSTEM, Host;
+
+  VAR kbdCode: BYTE; (*last keyboard code read*)
+    Recd, Up, Shift, Ctrl, Ext: BOOLEAN;
+    KTabAdr: INTEGER;  (*keyboard code translation table*)
+    MW, MH, MX, MY: INTEGER; (*mouse limits and coords*)
+    MK: SET; (*mouse keys*)
+    MC, MCC: INTEGER;
+    GetMouseWinCoords: PROCEDURE (): INTEGER;
+    GetMouseState: PROCEDURE (): SET;
+    GetKey: PROCEDURE (): INTEGER;
+    GetModifiers: PROCEDURE (): SET;
+    CheckEvent: PROCEDURE (): INTEGER;
+    GetButton: PROCEDURE (): INTEGER;
+    WaitEvent: PROCEDURE (): INTEGER;
+    SetKeyboardMode: PROCEDURE (mode: INTEGER);
+    InstallCursor: PROCEDURE (handle: INTEGER): INTEGER;
+
+(*FIFO implemented in hardware, because every read must be handled,
+  including tracking the state of the Shift and Ctrl keys*)
+  
+  PROCEDURE Handle(event: INTEGER; VAR continue: BOOLEAN);
+    VAR key: INTEGER;
+  BEGIN
+    IF event = 2 THEN (*key*)
+      continue := ~Recd;
+      IF ~Recd THEN
+        key := GetKey();
+        IF key MOD 256 = 0 THEN (*ignore hotkeys*)
+          (*kbdCode := key DIV 65536 MOD 128; Up := ODD(key DIV 800000H);
+          s := GetModifiers(); Shift := s * {0, 1} # {}; Ctrl := s * {2} # {}; Recd := ~Up*)
+          kbdCode := key DIV 256 MOD 128; Up := ODD(key DIV 32768);
+          IF (kbdCode = 42) OR (kbdCode = 54) THEN (*shift*) Shift := ~Up
+          ELSIF kbdCode = 29 THEN (*ctrl*) Ctrl := ~Up
+          ELSIF ~Up THEN Recd := TRUE (*real key going down*)
+          END
+        END
+      END
+    ELSIF event = 3 THEN (*button*)
+      key := GetButton();
+      IF key # 1 THEN
+        IF key DIV 256 MOD 1000000H = 1 THEN (*close*)
+          Host.Exit
+        END
+      END;
+      continue := TRUE
+    ELSIF event = 6 THEN (*mouse*)
+      key := GetMouseWinCoords(); (*unmark event*)
+      continue := TRUE
+    END
+  END Handle;
+
+  (*PROCEDURE Peek(wait: BOOLEAN);
+    VAR event, key: INTEGER; s: SET; done: BOOLEAN;
+  BEGIN done := FALSE;
+    event := CheckEvent();
+    WHILE event # 0 DO
+      IF event = 1 THEN (*repaint*)
+        Host.Repaint(0, 0, Host.Width, Host.Height)
+      ELSIF event = 2 THEN (*key*)
+        IF ~Recd THEN
+          key := GetKey();
+          IF key MOD 256 = 0 THEN (*ignore hotkeys*)
+            (*kbdCode := key DIV 65536 MOD 128; Up := ODD(key DIV 800000H);
+            s := GetModifiers(); Shift := s * {0, 1} # {}; Ctrl := s * {2} # {}; Recd := ~Up*)
+            kbdCode := key DIV 256 MOD 128; Up := ODD(key DIV 32768);
+            IF (kbdCode = 42) OR (kbdCode = 54) THEN (*shift*) Shift := ~Up
+            ELSIF kbdCode = 29 THEN (*ctrl*) Ctrl := ~Up
+            ELSIF ~Up THEN Recd := TRUE (*real key going down*)
+            END
+          END
+        ELSE done := TRUE (*alreay received, interrupt loop*)
+        END
+      ELSIF event = 3 THEN (*button*)
+        key := GetButton();
+        IF key # 1 THEN
+          IF key DIV 256 MOD 1000000H = 1 THEN (*close*)
+            Host.Exit
+          END
+        END
+      ELSIF event = 5 THEN (*background*)
+        Host.Repaint(0, 0, Host.Width, Host.Height)
+      ELSIF event = 6 THEN (*mouse*)
+        key := GetMouseWinCoords() (*unmark event*)
+      ELSE done := TRUE (*unknown event, interrupt*)
+      END;
+      IF done THEN event := 0
+      ELSIF ~wait OR Recd THEN event := CheckEvent()
+      ELSE event := WaitEvent()
+      END
+    END
+  END Peek;*)
+
+  PROCEDURE Peek(wait: INTEGER);
+  BEGIN Host.HandleEvents(wait, TRUE)
+  END Peek;
+
+  PROCEDURE Available*(): INTEGER;
+  BEGIN Peek(0);
+    RETURN ORD(Recd)
+  END Available;
+
+  PROCEDURE Read*(VAR ch: CHAR);
+  BEGIN
+    Peek(0); (*handle events*)
+    WHILE ~Recd DO Peek(-1) END; (*wait events*)
+    IF Shift OR Ctrl THEN INC(kbdCode, 80H) END; (*ctrl implies shift*)
+  (* ch := kbdTab[kbdCode]; *)
+    SYSTEM.GET(KTabAdr + kbdCode, ch);
+    IF Ctrl THEN ch := CHR(ORD(ch) MOD 20H) END;
+    Recd := FALSE
+  END Read;
+
+  PROCEDURE Mouse*(VAR keys: SET; VAR x, y: INTEGER);
+    VAR point, old, X, Y: INTEGER; s: SET;
+  BEGIN Peek(0); MK := {};
+    point := GetMouseWinCoords();
+    X := point DIV 65536; Y := MH - point * 65536 DIV 65536;
+    IF (X >= 0) & (Y >= 0) & (X < MW) & (Y < MH) THEN
+      s := GetMouseState(); MX := X; MY := Y;
+      IF 0 IN s THEN INCL(MK, 2) END;
+      IF 1 IN s THEN INCL(MK, 0) END;
+      IF 2 IN s THEN INCL(MK, 1) END;
+      IF MCC # MC THEN
+        old := InstallCursor(MCC); MC := MCC
+      END
+    ELSIF MC # Host.default THEN
+      MCC := InstallCursor(Host.default); MC := Host.default
+    END;
+    IF MX < 0 THEN MX := 0 ELSIF MX >= MW THEN MX := MW-1 END;
+    IF MY < 0 THEN MY := 0 ELSIF MY >= MH THEN MY := MH-1 END;
+    keys := MK; x := MX; y := MY
+  END Mouse;
+
+  PROCEDURE SetMouseLimits*(w, h: INTEGER);
+  BEGIN MW := w; MH := h
+  END SetMouseLimits;
+
+  PROCEDURE Init*;
+  BEGIN Up := FALSE; Shift := FALSE; Ctrl := FALSE; Recd := FALSE;
+    KTabAdr := SYSTEM.ADR($
+      00 1B 31 32 33 34 35 36  37 38 39 30 2D 3D 08 09
+      71 77 65 72 74 79 75 69  6F 70 5B 5D 0D 00 61 73
+      64 66 67 68 6A 6B 6C 3B  27 60 00 5C 7A 78 63 76
+      62 6E 6D 2C 2E 2F 00 00  00 20 00 1A 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 7F 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 1B 21 40 23 24 25 5E  26 2A 28 29 5F 2B 08 09
+      51 57 45 52 54 59 55 49  4F 50 7B 7D 0D 00 41 53
+      44 46 47 48 4A 4B 4C 3A  22 7E 00 7C 5A 58 43 56
+      42 4E 4D 3C 3E 3F 00 00  00 20 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 7F 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00$);
+    SYSTEM.PUT(SYSTEM.ADR(GetMouseWinCoords), SYSTEM.ADR($B825000000 BB01000000 CD40 C3 6690 90$));
+    SYSTEM.PUT(SYSTEM.ADR(GetMouseState), SYSTEM.ADR($B825000000 BB02000000 CD40 C3 6690 90$));
+    SYSTEM.PUT(SYSTEM.ADR(GetKey), SYSTEM.ADR($B802000000 CD40 C3$));
+    SYSTEM.PUT(SYSTEM.ADR(GetModifiers), SYSTEM.ADR($B842000000 BB03000000 CD40 C3 6690 90$));
+    SYSTEM.PUT(SYSTEM.ADR(CheckEvent), SYSTEM.ADR($B80B000000 CD40 C3$));
+    SYSTEM.PUT(SYSTEM.ADR(GetButton), SYSTEM.ADR($B811000000 CD40 C3$));
+    SYSTEM.PUT(SYSTEM.ADR(WaitEvent), SYSTEM.ADR($B80A000000 CD40 C3$));
+    SYSTEM.PUT(SYSTEM.ADR(SetKeyboardMode), SYSTEM.ADR($55 89E5 B842000000 BB01000000 8B4D08 CD40 5D C20400 90$));
+    SYSTEM.PUT(SYSTEM.ADR(InstallCursor), SYSTEM.ADR($55 89E5 B825000000 BB05000000 8B4D08 CD40 5D C20400 6690 90$));
+    MCC := Host.hidden;
+    SetKeyboardMode(1); (*scancode-mode*)
+    Host.SetHandler(2, Handle); (*key*)
+    Host.SetHandler(3, Handle); (*button*)
+    Host.SetHandler(6, Handle); (*mouse*)
+  END Init;
+
+BEGIN Init
+END Input.

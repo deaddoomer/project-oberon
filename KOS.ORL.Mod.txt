@@ -1,0 +1,323 @@
+MODULE ORL;
+  IMPORT Files, Texts, Oberon;
+
+  CONST
+    versionkey = 0AX; MT = 3; DescSize = 80;
+    MTSize = 64; ModLim = 40000H; MaxModLim = 80000H; org = 64;
+    MTOrg = org + 32; limit = org + ModLim;
+
+  TYPE
+    Module = POINTER TO ModDesc;
+    ModuleName = ARRAY 32 OF CHAR;
+
+    ModDesc = RECORD
+      name: ModuleName;
+      next: Module;
+      key, num, size, refcnt: INTEGER;
+      data, code, imp, cmd, ent, ptr, unused: INTEGER;  (*addresses*)
+      adr, body: INTEGER;
+    END;
+
+    Memory = POINTER TO MemoryDesc;
+    MemoryDesc = RECORD
+      x: ARRAY ModLim OF BYTE
+    END;
+
+  VAR W: Texts.Writer;
+    root, M: Module;
+    AllocPtr, res: INTEGER;
+    importing, imported: ModuleName;
+    m: Memory;
+
+  PROCEDURE Put1 (a: INTEGER; ch: CHAR);
+  BEGIN m.x[a-org] := ORD(ch)
+  END Put1;
+
+  PROCEDURE Put4 (a, x: INTEGER);
+  BEGIN DEC(a, org);
+    m.x[a] := x; m.x[a+1] := x DIV 256; m.x[a+2] := x DIV 65536; m.x[a+3] := x DIV 16777216
+  END Put4;
+  
+  PROCEDURE Get4 (a: INTEGER; VAR x: INTEGER);
+  BEGIN DEC(a, org); x := m.x[a] + m.x[a+1] * 256 + m.x[a+2] * 65536 + m.x[a+3] * 16777216
+  END Get4;
+
+  PROCEDURE MakeFileName(VAR FName: ModuleName; name, ext: ARRAY OF CHAR);
+    VAR i, j: INTEGER;
+  BEGIN i := 0; j := 0;  (*assume name suffix less than 4 characters*)
+    WHILE (i < LEN(ModuleName)-5) & (name[i] > 0X) DO FName[i] := name[i]; INC(i) END ;
+    REPEAT FName[i]:= ext[j]; INC(i); INC(j) UNTIL ext[j] = 0X;
+    FName[i] := 0X
+  END MakeFileName;
+
+  PROCEDURE ThisFile(name: ARRAY OF CHAR): Files.File;
+    VAR filename: ModuleName;
+  BEGIN MakeFileName(filename, name, ".int");
+    RETURN Files.Old(filename)
+  END ThisFile;
+
+  PROCEDURE error(n: INTEGER; name: ARRAY OF CHAR);
+  BEGIN res := n; importing := name
+  END error;
+
+  PROCEDURE Check(s: ARRAY OF CHAR);
+    VAR i: INTEGER; ch: CHAR;
+  BEGIN ch := s[0]; res := 1; i := 1;
+    IF (ch >= "A") & (ch <= "Z") OR (ch >= "a") & (ch <= "z") THEN
+      REPEAT ch := s[i]; INC(i)
+      UNTIL ~((ch >= "0") & (ch <= "9") OR (ch >= "A") & (ch <= "Z")
+        OR (ch >= "a") & (ch <= "z") OR (ch = ".")) OR (i = 32);
+      IF (i < 32) & (ch = 0X) THEN res := 0 END
+    END
+  END Check;
+
+  PROCEDURE FixModule(mod: Module);
+    VAR a, i: INTEGER;
+  BEGIN
+    a := mod.adr;
+    FOR i := 0 TO LEN(ModuleName) - 1 DO
+      Put1(a, mod.name[i]); INC(a)
+    END;
+    IF mod.next = NIL THEN i := 0 ELSE i := mod.next.adr END;
+    Put4(a, i); INC(a, 4);
+    Put4(a, mod.key); INC(a, 4);
+    Put4(a, mod.num); INC(a, 4);
+    Put4(a, mod.size); INC(a, 4);
+    Put4(a, mod.refcnt); INC(a, 4);
+    Put4(a, mod.data); INC(a, 4);
+    Put4(a, mod.code); INC(a, 4);
+    Put4(a, mod.imp); INC(a, 4);
+    Put4(a, mod.cmd); INC(a, 4);
+    Put4(a, mod.ent); INC(a, 4);
+    Put4(a, mod.ptr); INC(a, 4);
+    Put4(a, mod.unused); INC(a, 4);
+  END FixModule;
+
+  PROCEDURE LinkIt(name: ARRAY OF CHAR; VAR newmod: Module);
+    (*search module in list; if not found, load module.
+      res = 0: already present or loaded; res = 2: file not available; res = 3: key conflict;
+      res = 4: bad file version; res = 5: corrupted file; res = 7: no space*)
+    VAR mod, impmod: Module;
+      i, n, key, impkey, mno, nofimps, size: INTEGER;
+      p, u, v, w: INTEGER;  (*addresses*)
+      ch: CHAR;
+      fixorgP, fixorgD, fixorgT: INTEGER;
+      disp, adr, inst, pno, vno, dest, offset: INTEGER;
+      name1, impname: ModuleName;
+      F: Files.File; R: Files.Rider;
+      import: ARRAY 16 OF Module;
+  BEGIN mod := root; error(0, name); nofimps := 0;
+    WHILE (mod # NIL) & (name # mod.name) DO mod := mod.next END;
+    IF mod = NIL THEN (*load*)
+      Check(name);
+      IF res = 0 THEN F := ThisFile(name) ELSE F := NIL END;
+      IF F # NIL THEN
+        Files.Set(R, F, 0); Files.ReadString(R, name1); Files.ReadInt(R, key); Files.Read(R, ch);
+        Files.ReadInt(R, size); importing := name1;
+        IF ch = versionkey THEN
+          Files.ReadString(R, impname);   (*imports*)
+          WHILE (impname[0] # 0X) & (res = 0) DO
+            Files.ReadInt(R, impkey);
+            LinkIt(impname, impmod); import[nofimps] := impmod; importing := name1;
+            IF res = 0 THEN
+              IF impmod.key = impkey THEN INC(impmod.refcnt); INC(nofimps)
+              ELSE error(3, name1); imported := impname
+              END
+            END;
+            Files.ReadString(R, impname)
+          END
+        ELSE error(2, name1)
+        END
+      ELSE error(1, name)
+      END;
+      IF res = 0 THEN (*search for a hole in the list allocate and link*)
+        INC(size, DescSize); mod := root;
+        WHILE (mod # NIL) & ~((mod.name[0] = 0X) & (mod.size >= size)) DO mod := mod.next END;
+        IF mod = NIL THEN (*no large enough hole was found*)
+          IF AllocPtr + size < limit THEN (*allocate*)
+            p := AllocPtr; NEW(mod); mod.adr := p;
+            AllocPtr := (p + size + 100H) DIV 20H * 20H; mod.size := AllocPtr - p; mod.num := root.num + 1;
+            mod.next := root; root := mod
+          ELSE error(7, name1)
+          END
+        ELSE (*fill hole*) p := mod.adr
+        END
+      END; 
+      IF res = 0 THEN (*read file*)
+        INC(p, DescSize); (*allocate descriptor*)
+        i := 0; REPEAT ch := name[i]; mod.name[i] := ch; INC(i) UNTIL ch = 0X; mod.key := key; mod.refcnt := 0;
+        mod.data := p;  (*data*)
+        Put4(mod.num * 4 + MTOrg, p);  (*module table entry*)
+        Files.ReadInt(R, n);
+        WHILE n > 0 DO Files.ReadInt(R, w); Put4(p, w); INC(p, 4); DEC(n, 4) END;  (*type descriptors*)
+        Files.ReadInt(R, n);
+        WHILE n > 0 DO Put4(p, 0); INC(p, 4); DEC(n, 4) END;  (*variable space*)
+        Files.ReadInt(R, n);
+        WHILE n > 0 DO Files.Read(R, ch); Put1(p, ch); INC(p); DEC(n) END;   (*strings*)
+        mod.code := p;  (*program*)
+        Files.ReadInt(R, n);
+        WHILE n > 0 DO Files.ReadInt(R, w); Put4(p, w); INC(p, 4); DEC(n) END;  (*program code*)
+        mod.imp := p;  (*copy imports*)
+        i := 0;
+        WHILE i < nofimps DO
+          Put4(p, import[i].adr); INC(p, 4); INC(i)
+        END;
+        mod.cmd := p;  (*commands*) Files.Read(R, ch);
+        WHILE ch # 0X DO
+          REPEAT Put1(p, ch); INC(p); Files.Read(R, ch) UNTIL ch = 0X;
+          REPEAT Put1(p, 0X); INC(p) UNTIL p MOD 4 = 0;
+          Files.ReadInt(R, n); Put4(p, n); INC(p, 4); Files.Read(R, ch)
+        END;
+        REPEAT Put1(p, 0X); INC(p) UNTIL p MOD 4 = 0;
+        mod.ent := p;  (*entries*)
+        Files.ReadInt(R, n);
+        WHILE n > 0 DO Files.ReadInt(R, w); Put4(p, w); INC(p, 4); DEC(n) END;
+        mod.ptr := p;  (*pointer references*)
+        Files.ReadInt(R, w);
+        WHILE w >= 0 DO Put4(p, mod.data + w); INC(p, 4); Files.ReadInt(R, w) END;
+        Put4(p, 0); INC(p, 4);
+        Files.ReadInt(R, fixorgP); Files.ReadInt(R, fixorgD); Files.ReadInt(R, fixorgT);
+        Files.ReadInt(R, w); mod.body := mod.code + w;
+        Files.Read(R, ch);
+        IF ch # "O" THEN (*corrupted file*) mod := NIL; error(4, name) END
+      END;
+      IF res = 0 THEN
+        FixModule(mod);
+        (*fixup of CALL*)
+        adr := mod.code + fixorgP;
+        WHILE adr # mod.code DO
+          Get4(adr, inst);
+          pno := inst DIV 40000H;
+          mno := inst DIV 4000H MOD 10H;
+          disp := inst MOD 4000H;
+          IF mno = 0 THEN (*abs*)
+            Put4(adr, mod.code + pno MOD 4000H * 4); 
+          ELSE (*import*)
+            impmod := import[mno - 1];
+            IF pno < 0 THEN (*rel*)
+              Get4(impmod.ent - pno*4, dest);
+              Put4(adr, impmod.code + dest - adr - 4);
+            ELSE (*abs*)
+              Get4(impmod.ent + pno*4, dest);
+              Put4(adr, impmod.code + dest)
+            END
+          END;
+          adr := adr - disp
+        END;
+        (*fixup of MOV*)
+        adr := mod.code + fixorgD;
+        WHILE adr # mod.code DO
+          Get4(adr, inst);
+          vno := inst DIV 10000H MOD 10000H;
+          mno := inst DIV 1000H MOD 10H;
+          disp := inst MOD 1000H;
+          IF mno = 0 THEN (*global*)
+            IF vno = 0FFFFH THEN Put4(adr, MTOrg) (* MT *)
+            ELSE Put4(adr, mod.data + vno) (* global var offset *)
+            END
+          ELSE (*import*)
+            impmod := import[mno - 1];
+            Get4(impmod.ent + vno*4, offset);
+            Put4(adr, impmod.data + offset)
+          END;
+          adr := adr - disp
+        END;
+        (*fixup of type descriptors*)
+        adr := mod.data + fixorgT*4;
+        WHILE adr # mod.data DO
+          Get4(adr, inst);
+          mno := inst DIV 1000000H MOD 10H;
+          vno := inst DIV 1000H MOD 1000H;
+          disp := inst MOD 1000H;
+          IF mno = 0 THEN (*global*) inst := mod.data + vno
+          ELSE (*import*)
+            impmod := import[mno - 1];
+            Get4(impmod.ent + vno*4, offset);
+            inst := impmod.data + offset
+          END;
+          Put4(adr, inst); adr := adr - disp*4
+        END
+      ELSIF res >= 3 THEN importing := name;
+        WHILE nofimps > 0 DO DEC(nofimps); DEC(import[nofimps].refcnt) END
+      END;
+    END;
+    newmod := mod
+  END LinkIt;
+
+  PROCEDURE WriteHeader(M: Module);
+    VAR i, len: INTEGER;
+      filename: ModuleName;
+      F: Files.File;
+      R: Files.Rider;
+  BEGIN MakeFileName(filename, M.name, ".kex");
+    F := Files.New(filename); Files.Set(R, F, 0);
+    Files.WriteInt(R, 554E454DH); Files.WriteInt(R, 31305445H); (*MENUET01*)
+    Files.WriteInt(R, 1); (*version*)
+    Files.WriteInt(R, M.body); (*eip*)
+    Files.WriteInt(R, AllocPtr); (*image size*)
+    Files.WriteInt(R, MaxModLim + 4 + 1024 + 256); (*memory size*)
+    Files.WriteInt(R, MaxModLim); (*esp*)
+    Files.WriteInt(R, MaxModLim + 4 + 1024); (*cmdline*)
+    Files.WriteInt(R, MaxModLim + 4); (*path*)
+    i := Files.Pos(R); WHILE i < org DO Files.WriteByte(R, 0); INC(i) END; (*pad*)
+    ASSERT(Files.Pos(R) = org);
+    Put4(org + 0, M.body); (* MTOrg-32: Soft reset vector *)
+    Put4(org + 4, 0); (* MTOrg-28: Interrupt vector *)
+    Put4(org + 8, 0); (* MTOrg-24: ??? *)
+    Put4(org + 12, MaxModLim + 4 + 1024 + 256); (* MTOrg-20: The limit of available memory *)
+    Put4(org + 16, AllocPtr); (* MTOrg-16: The address of the end of the module space loaded  *)
+    Put4(org + 20, root.adr); (* MTOrg-12: The current root of the links of loaded modules *)
+    Put4(org + 24, MaxModLim); (* MTOrg-8: The current limit of the module area *)
+    Put4(org + 28, 0); (* MTOrg-4: ? *)
+    i := 0; len := AllocPtr - org;
+    WHILE i < len DO Files.WriteByte(R, m.x[i]); INC(i) END;
+    Files.Register(F);
+    Texts.WriteString(W, filename); Texts.WriteString(W, " linked");
+    Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+  END WriteHeader;
+
+  PROCEDURE Link*;
+    VAR beg, end, time: INTEGER;
+      T: Texts.Text;
+      S: Texts.Scanner;
+      M: Module;
+  BEGIN M := NIL; NEW(m); NEW(root); AllocPtr := MTOrg + 4*MTSize; res := 0;
+    Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+    IF (S.class = Texts.Char) & (S.c = "^") THEN
+      Oberon.GetSelection(T, beg, end, time);
+      IF time >= 0 THEN
+        Texts.OpenScanner(S, T, beg); Texts.Scan(S);
+        IF S.class = Texts.Name THEN
+          LinkIt(S.s, M)
+        END
+      END
+    ELSE
+      WHILE (res = 0) & (S.class = Texts.Name) DO
+        LinkIt(S.s, M); Texts.Scan(S)
+      END
+    END;
+    IF res = 0 THEN
+      WriteHeader(M)
+    ELSE
+      Texts.WriteString(W, "link error: "); Texts.WriteString(W, importing);
+      IF res = 1 THEN Texts.WriteString(W, " module not found")
+      ELSIF res = 2 THEN  Texts.WriteString(W, " bad version")
+      ELSIF res = 3 THEN Texts.WriteString(W, " imports ");
+        Texts.WriteString(W, imported); Texts.WriteString(W, " with bad key");
+      ELSIF res = 4 THEN Texts.WriteString(W, " corrupted obj file")
+      ELSIF res = 5 THEN Texts.WriteString(W, " command not found")
+      ELSIF res = 7 THEN Texts.WriteString(W, " insufficient space")
+      END;
+      Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+    END;
+    m := NIL; root := NIL;
+    Oberon.Collect(0)
+  END Link;
+
+  PROCEDURE Load*;
+  END Load;
+
+BEGIN Texts.OpenWriter(W); Texts.WriteString(W, "OR386 Linker  30.08.2024");
+  Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+END ORL.
+

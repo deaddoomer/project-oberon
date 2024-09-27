@@ -1,0 +1,559 @@
+MODULE Files;  (*NW 11.1.86 / 22.9.93 / 25.5.95 / 25.12.95 / 15.8.2013*)
+  IMPORT SYSTEM, Kernel, FileDir;
+
+  (*A file consists of a sequence of pages. The first page
+    contains the header. Part of the header is the page table, an array
+    of disk addresses to the pages. A file is referenced through riders.
+    A rider indicates a current position and refers to a file*)
+
+  CONST MaxBufs    = 4;
+      SS        = FileDir.SectorSize;
+      FullLength = FileDir.SecTabSize * 4;
+
+  TYPE  DiskAdr = INTEGER;
+      File*    = POINTER TO FileDesc;
+      Buffer  = POINTER TO BufferRecord;
+      FullName = ARRAY FullLength OF CHAR;
+
+    Rider* =
+      RECORD eof*: BOOLEAN;
+        res*: INTEGER;
+        file: File;
+        apos, bpos: INTEGER;
+        buf: Buffer
+      END ;
+
+    FileDesc =
+      RECORD next: INTEGER; (*list of files invisible to the GC*)
+        nofbufs, aleng, bleng: INTEGER;
+        modH, registered: BOOLEAN;
+        firstbuf: Buffer;
+        attr: SET;
+        name: FileDir.FileName;
+        date: INTEGER;
+        ext:  ARRAY FileDir.ExTabSize OF File; (*keep for symbol file compatibility*)
+        (*sec: ARRAY FileDir.SecTabSize OF INTEGER*) (*device/inode, pad*)
+        fullname: FullName
+      END ;
+
+    BufferRecord =
+      RECORD apos, lim: INTEGER;
+        mod: BOOLEAN;
+        next: Buffer;
+        data: FileDir.DataSector
+      END ;
+
+    FilePar =
+      RECORD
+        fn, offset, flags, size, data, enc, path: INTEGER
+      END ;
+
+    FileAttr =
+      RECORD
+        attr: SET;
+        enc: INTEGER;
+        ctime, cdate, atime, adate, mtime, mdate: ARRAY 4 OF BYTE;
+        loSize, hiSize: INTEGER;
+        (*name: ARRAY 520 OF CHAR*)
+      END ;
+
+    (*aleng * SS + bleng = length (including header)
+      apos * SS + bpos = current position
+      0 <= bpos <= lim <= SS
+      0 <= apos <= aleng < PgTabSize
+      (apos < aleng) & (lim = SS) OR (apos = aleng) *)
+
+  VAR root: INTEGER (*File*);  (*list of open files*)
+    hostpath: FullName;
+    FileCall: PROCEDURE (f: FilePar; VAR count: INTEGER): INTEGER; (*fn80*)
+    GetCWD: PROCEDURE (buf, size, enc: INTEGER): INTEGER; (*fn30.5*)
+
+  PROCEDURE BCDToClock (t, d: ARRAY OF BYTE): INTEGER;
+  BEGIN RETURN ORD((((((d[3] * 256 + d[2]) MOD 100 * 10H + d[1])*20H + d[0])*20H + t[2])*40H + t[1])*40H + t[0])
+  END BCDToClock;
+
+  PROCEDURE Decimal (VAR s: ARRAY OF CHAR; j, x: INTEGER);
+    VAR i: INTEGER; x0: LONGINT; a: ARRAY 12 OF CHAR;
+  BEGIN
+    IF ROR(x, 31) = 1 THEN a := "8463847412-"; i := 12
+    ELSE i := 0;
+      IF x < 0 THEN x0 := -x ELSE x0 := x END;
+      REPEAT
+        a[i] := CHR(x0 MOD 10 + 30H); x0 := x0 DIV 10; INC(i)
+      UNTIL x0 = 0;
+      IF x < 0 THEN a[i] := "-"; INC(i) END
+    END;
+    REPEAT DEC(i); s[j] := a[i]; INC(j) UNTIL i = 0; s[j] := 0X
+  END Decimal;
+
+  PROCEDURE MakeFileName (VAR name: ARRAY OF CHAR; a, b: ARRAY OF CHAR; VAR res: INTEGER);
+    VAR i, j: INTEGER; ch: CHAR;
+  BEGIN i := 0; res := 4; ch := a[0]; j := 1;
+    WHILE (ch # 0X) & (i < LEN(name)) DO name[i] := ch; ch := a[j]; INC(i); INC(j) END;
+    IF i < LEN(name) THEN
+      j := 0; REPEAT ch := b[j]; name[i] := ch; INC(i); INC(j) UNTIL (ch = 0X) OR (i >= LEN(name));
+      IF ch = 0X THEN res := 0 END
+    END
+  END MakeFileName;
+
+  PROCEDURE Check(s: ARRAY OF CHAR;
+        VAR name: FileDir.FileName; VAR res: INTEGER);
+    VAR i: INTEGER; ch: CHAR;
+  BEGIN ch := s[0]; i := 0;
+    IF (ch >= "A") & (ch <= "Z") OR (ch >= "a") & (ch <= "z") THEN
+      REPEAT name[i] := ch; INC(i); ch := s[i]
+      UNTIL ~((ch >= "0") & (ch <= "9") OR (ch >= "A") & (ch <= "Z")
+        OR (ch >= "a") & (ch <= "z") OR (ch = ".")) OR (i = FileDir.FnLength);
+      IF i = FileDir.FnLength THEN res := 4
+      ELSIF ch = 0X THEN res := 0;
+        WHILE i < FileDir.FnLength DO name[i] := 0X; INC(i) END
+      ELSE res := 5
+      END
+    ELSIF ch = 0X THEN name[0] := 0X; res := -1
+    ELSE res := 3
+    END
+  END Check;
+
+  PROCEDURE Old*(name: ARRAY OF CHAR): File;
+    VAR res, count: INTEGER;
+      f: File;
+      buf: Buffer;
+      st: FilePar;
+      namebuf: FileDir.FileName;
+      fullname: FullName;
+      info: FileAttr;
+  BEGIN f := NIL; Check(name, namebuf, res);
+    IF res = 0 THEN
+      MakeFileName(fullname, hostpath, namebuf, res);
+      IF res = 0 THEN
+        f := SYSTEM.VAL(File, root);
+        WHILE (f # NIL) & (f.fullname # fullname) DO f := SYSTEM.VAL(File, f.next) END;
+        IF f = NIL THEN (*file not yet present*)
+          st.fn := 5; st.offset := 0; st.flags := 0; st.size := 0; st.data := SYSTEM.ADR(info);
+          st.enc := 3; st.path := SYSTEM.ADR(fullname);
+          res := FileCall(st, count);
+          IF (res = 0) & (info.attr * {3, 4} = {}) & (info.hiSize = 0) & (info.loSize >= 0) THEN (*not label, not folder*)
+            NEW(buf); buf.apos := 0; buf.next := buf; buf.mod := FALSE;
+            st.fn := 0; st.offset := 0; st.flags := 0; st.size := SS; st.data := SYSTEM.ADR(buf.data);
+            res := FileCall(st, count);
+            IF ((res = 0) & (count = SS)) OR ((res = 6) & (count = info.loSize)) THEN
+              buf.lim := count;
+              NEW(f); f.aleng := info.loSize DIV SS; f.bleng := info.loSize MOD SS; f.date := BCDToClock(info.ctime, info.cdate);
+              f.firstbuf := buf; f.nofbufs := 1; f.name := namebuf; f.registered := TRUE;
+              f.fullname := fullname; f.attr := info.attr; f.modH := FALSE;
+              f.next := root; root := SYSTEM.VAL(INTEGER, f)
+            END
+          END
+        END
+      END
+    END ;
+    RETURN f
+  END Old;
+
+  PROCEDURE New*(name: ARRAY OF CHAR): File;
+    VAR res, t, i, count: INTEGER;
+      f: File;
+      buf: Buffer;
+      st: FilePar;
+      namebuf, tempbuf: FileDir.FileName;
+      fullname: FullName;
+      info: FileAttr;
+  BEGIN f := NIL; Check(name, namebuf, res);
+    IF res <= 0 THEN
+      t := Kernel.Time(); i := 0; tempbuf := "0BN";
+      REPEAT
+        Decimal(tempbuf, 3, t MOD 100000);
+        count := 0; WHILE tempbuf[count] # 0X DO INC(count) END;
+        tempbuf[count] := "."; tempbuf[count+1] := "T"; tempbuf[count+2] := "M"; tempbuf[count+3] := "P";
+        tempbuf[count+4] := 0X;
+        MakeFileName(fullname, hostpath, tempbuf, res);
+        IF res = 0 THEN
+          st.fn := 5; st.offset := 0; st.flags := 0; st.size := 0; st.data := SYSTEM.ADR(info);
+          st.enc := 3; st.path := SYSTEM.ADR(fullname);
+          res := FileCall(st, count);
+          IF res = 5 THEN (*file not found*)
+            st.fn := 2; st.offset := 0; st.flags := 0; st.size := 0; st.data := 0;
+            st.enc := 3; st.path := SYSTEM.ADR(fullname);
+            res := FileCall(st, count);
+            IF res = 0 THEN (*bug: possible race condition: getattr+create may overwrite existing temp file*)
+              NEW(buf); buf.apos := 0; buf.mod := TRUE; buf.lim := 0; buf.next := buf;
+              NEW(f); f.aleng := 0; f.bleng := 0; f.modH := TRUE;
+              f.registered := FALSE; f.date := Kernel.Clock();
+              f.firstbuf := buf; f.nofbufs := 1; f.name := namebuf; f.attr := {};
+              f.fullname := fullname;
+              f.next := root; root := SYSTEM.VAL(INTEGER, f)
+            END
+          END
+        END ;
+        INC(i); INC(t);
+      UNTIL (f # NIL) OR (i >= 1000) OR (res # 0)
+    END ;
+    RETURN f
+  END New;
+
+  PROCEDURE ReadBuf(f: File; buf: Buffer; pos: INTEGER);
+    VAR res, count: INTEGER; st: FilePar;
+  BEGIN
+    st.fn := 0; st.offset := pos * SS; st.flags := 0; st.size := SS; st.data := SYSTEM.ADR(buf.data);
+    st.enc := 3; st.path := SYSTEM.ADR(f.fullname);
+    res := FileCall(st, count);
+    ASSERT((res = 0) & (count = SS) OR (res = 6) & (count = f.bleng));
+    buf.lim := count; buf.apos := pos; buf.mod := FALSE
+  END ReadBuf;
+
+  PROCEDURE WriteBuf(f: File; buf: Buffer);
+    VAR res, count: INTEGER; st: FilePar;
+  BEGIN
+    ASSERT(~(0 IN f.attr)); (*writable*)
+    (*IF buf.apos > f.aleng THEN (*extend file*)
+      st.fn := 4; st.offset := buf.apos * SS + buf.lim; st.flags := 0; st.size := 0; st.data := 0;
+      st.enc := 3; st.name := SYSTEM.ADR(f.fullname);
+      res := FileCall(st, count);
+      ASSERT(res = 0)
+    END;*)
+    st.fn := 3; st.offset := buf.apos * SS; st.flags := 0; st.size := buf.lim; st.data := SYSTEM.ADR(buf.data);
+    st.enc := 3; st.path := SYSTEM.ADR(f.fullname);
+    res := FileCall(st, count);
+    ASSERT((res = 0) & (count = buf.lim));
+    f.modH := TRUE; buf.mod := FALSE
+  END WriteBuf;
+
+  PROCEDURE Buf(f: File; pos: INTEGER): Buffer;
+    VAR buf: Buffer;
+  BEGIN buf := f.firstbuf;
+    WHILE (buf.apos # pos) & (buf.next # f.firstbuf) DO buf := buf.next END ;
+    IF buf.apos # pos THEN buf := NIL END ;
+    RETURN buf
+  END Buf;
+
+  PROCEDURE GetBuf(f: File; pos: INTEGER): Buffer;
+    VAR buf: Buffer;
+  BEGIN buf := f.firstbuf;
+    WHILE (buf.apos # pos) & (buf.next # f.firstbuf) DO buf := buf.next END ;
+    IF buf.apos # pos THEN 
+      IF f.nofbufs < MaxBufs THEN  (*allocate new buffer*)
+        NEW(buf); buf.next := f.firstbuf.next; f.firstbuf.next := buf; INC(f.nofbufs)
+      ELSE (*reuse a buffer*) f.firstbuf := buf;
+        IF buf.mod THEN WriteBuf(f, buf) END
+      END ;
+      IF pos <= f.aleng THEN ReadBuf(f, buf, pos) ELSE buf.apos := pos; buf.lim := 0; buf.mod := FALSE END
+    END ;
+    RETURN buf
+  END GetBuf;
+
+  PROCEDURE Unbuffer(f: File);
+    VAR res: INTEGER;
+      buf: Buffer;
+  BEGIN buf := f.firstbuf;
+    REPEAT
+      IF buf.mod THEN WriteBuf(f, buf) END ;
+      buf := buf.next
+    UNTIL buf = f.firstbuf;
+    f.modH := FALSE
+  END Unbuffer;
+
+  PROCEDURE Register*(f: File);
+    VAR res, count: INTEGER; st: FilePar; fullname: FullName;
+  BEGIN
+    IF (f # NIL) & (f.name[0] # 0X) THEN
+      Unbuffer(f);
+      IF ~f.registered THEN
+        MakeFileName(fullname, hostpath, f.name, res); ASSERT(res = 0);
+        REPEAT (*bug: possible race condition: may delete, but fail to rename; use loadfile+create+delete?*)
+          IF res = 10 THEN (*access denied when file exists*)
+            st.fn := 8; st.offset := 0; st.flags := 0; st.size := 0; st.data := 0;
+            st.enc := 3; st.path := SYSTEM.ADR(fullname);
+            res := FileCall(st, count); ASSERT((res = 0) OR (res = 5)); res := 0
+          END;
+          st.fn := 10; st.offset := 0; st.flags := 0; st.size := 0; st.data := SYSTEM.ADR(f.name);
+          st.enc := 3; st.path := SYSTEM.ADR(f.fullname);
+          res := FileCall(st, count);
+        UNTIL res # 10;
+        ASSERT(res = 0);
+        f.registered := TRUE; f.fullname := fullname
+      END
+    END
+  END Register;
+
+  PROCEDURE Close*(f: File);
+  BEGIN
+    IF f # NIL THEN Unbuffer(f) END
+  END Close;
+
+  PROCEDURE Purge*(f: File);
+    VAR res, count: INTEGER; st: FilePar;
+  BEGIN
+    IF f # NIL THEN
+      st.fn := 4; st.offset := 0; st.flags := 0; st.size := 0; st.data := 0;
+      st.enc := 3; st.path := SYSTEM.ADR(f.fullname);
+      res := FileCall(st, count);
+      ASSERT(res = 0);
+      f.aleng := 0; f.bleng := 0
+    END
+  END Purge;
+
+  PROCEDURE Delete*(name: ARRAY OF CHAR; VAR res: INTEGER);
+    VAR count: INTEGER;
+        namebuf: FileDir.FileName;
+        fullname: FullName;
+        st: FilePar;
+  BEGIN Check(name, namebuf, res);
+    IF res = 0 THEN
+      MakeFileName(fullname, hostpath, namebuf, res);
+      IF res = 0 THEN
+        st.fn := 8; st.offset := 0; st.flags := 0; st.size := 0; st.data := 0;
+        st.enc := 3; st.path := SYSTEM.ADR(fullname);
+        res := FileCall(st, count);
+        IF (res = 0) OR (res = 5) THEN res := 0 ELSE res := 2 END
+      END
+    END
+  END Delete;
+
+  PROCEDURE Rename*(old, new: ARRAY OF CHAR; VAR res: INTEGER);
+    VAR count: INTEGER;
+        oldbuf, newbuf: FileDir.FileName;
+        oldfull, newfull: FullName;
+        st: FilePar;
+  BEGIN Check(old, oldbuf, res);
+    IF res = 0 THEN
+      Check(new, newbuf, res);
+      IF res = 0 THEN
+        MakeFileName(oldfull, hostpath, oldbuf, res);
+        IF res = 0 THEN
+          MakeFileName(newfull, hostpath, newbuf, res);
+          IF res = 0 THEN
+            st.fn := 10; st.offset := 0; st.flags := 0; st.size := 0; st.data := SYSTEM.ADR(newfull);
+            st.enc := 3; st.path := SYSTEM.ADR(oldfull);
+            res := FileCall(st, count);
+            IF res # 0 THEN res := 2 END
+          END
+        END
+      END
+    END
+  END Rename;
+
+  PROCEDURE Length*(f: File): INTEGER;
+  BEGIN RETURN f.aleng * SS + f.bleng
+  END Length;
+
+  PROCEDURE Date*(f: File): INTEGER;
+  BEGIN RETURN f.date
+  END Date;
+
+  (*---------------------------Read---------------------------*)
+
+  PROCEDURE Set*(VAR r: Rider; f: File; pos: INTEGER);
+    VAR a, b: INTEGER;
+  BEGIN  r.eof := FALSE; r.res := 0;
+    IF f # NIL THEN
+      IF pos < 0 THEN a := 0; b := 0
+      ELSIF pos < f.aleng * SS + f.bleng THEN
+        a := pos DIV SS; b := pos MOD SS;
+      ELSE a := f.aleng; b := f.bleng
+      END ;
+      r.file := f; r.apos := a; r.bpos := b; r.buf := f.firstbuf
+    ELSE r.file:= NIL
+    END
+  END Set;
+
+  PROCEDURE Pos*(VAR r: Rider): INTEGER;
+  BEGIN RETURN r.apos * SS + r.bpos
+  END Pos;
+
+  PROCEDURE Base*(VAR r: Rider): File;
+  BEGIN RETURN r.file
+  END Base;
+
+  PROCEDURE ReadByte*(VAR r: Rider; VAR x: BYTE);
+    VAR buf: Buffer;
+  BEGIN
+    IF r.apos # r.buf.apos THEN r.buf := GetBuf(r.file, r.apos) END ;
+    IF r.bpos < r.buf.lim THEN x := r.buf.data[r.bpos]; INC(r.bpos)
+    ELSIF r.apos < r.file.aleng THEN
+      INC(r.apos); buf := Buf(r.file, r.apos);
+      IF buf = NIL THEN
+        IF r.buf.mod THEN WriteBuf(r.file, r.buf) END ;
+        ReadBuf(r.file, r.buf, r.apos)
+      ELSE r.buf := buf
+      END ;
+      x := r.buf.data[0]; r.bpos := 1
+    ELSE x := 0; r.eof := TRUE
+    END
+  END ReadByte;
+
+  PROCEDURE ReadBytes*(VAR r: Rider; VAR x: ARRAY OF BYTE; n: INTEGER);
+    VAR i: INTEGER;
+  BEGIN i := 0;  (*this implementation is to be improved*)
+    WHILE i < n DO ReadByte(r, x[i]); INC(i) END
+  END ReadBytes;
+
+  PROCEDURE Read*(VAR r: Rider; VAR ch: CHAR);
+    VAR buf: Buffer;  (*same as ReadByte*)
+  BEGIN
+    IF r.apos # r.buf.apos THEN r.buf := GetBuf(r.file, r.apos) END ;
+    IF r.bpos < r.buf.lim THEN ch := CHR(r.buf.data[r.bpos]); INC(r.bpos)
+    ELSIF r.apos < r.file.aleng THEN
+      INC(r.apos); buf := Buf(r.file, r.apos);
+      IF buf = NIL THEN
+        IF r.buf.mod THEN WriteBuf(r.file, r.buf) END ;
+        ReadBuf(r.file, r.buf, r.apos)
+      ELSE r.buf := buf
+      END ;
+      ch := CHR(r.buf.data[0]); r.bpos := 1
+    ELSE ch := 0X; r.eof := TRUE
+    END
+  END Read;
+
+  PROCEDURE ReadInt*(VAR R: Rider; VAR x: INTEGER);
+    VAR x0, x1, x2, x3: BYTE;
+  BEGIN ReadByte(R, x0); ReadByte(R, x1); ReadByte(R, x2); ReadByte(R, x3);
+    x := ((x3 * 100H + x2) * 100H + x1) * 100H + x0
+  END ReadInt;
+
+  PROCEDURE ReadSet*(VAR R: Rider; VAR s: SET);
+    VAR n: INTEGER;
+  BEGIN ReadInt(R, SYSTEM.VAL(INTEGER, s))
+  END ReadSet;
+
+  PROCEDURE ReadReal*(VAR R: Rider; VAR x: REAL);
+    VAR n: INTEGER;
+  BEGIN ReadInt(R, SYSTEM.VAL(INTEGER, x))
+  END ReadReal;
+
+  PROCEDURE ReadString*(VAR R: Rider; VAR x: ARRAY OF CHAR);
+    VAR i: INTEGER; ch: CHAR;
+  BEGIN i := 0; Read(R, ch);
+    WHILE ch # 0X DO
+      IF i < LEN(x)-1 THEN x[i] := ch; INC(i) END ;
+      Read(R, ch)
+    END ;
+    x[i] := 0X
+  END ReadString;
+
+  PROCEDURE ReadNum*(VAR R: Rider; VAR x: INTEGER);
+    VAR n, y: INTEGER; b: BYTE;
+  BEGIN n := 32; y := 0; ReadByte(R, b);
+    WHILE b >= 80H DO y := ROR(y + b-80H, 7); DEC(n, 7); ReadByte(R, b) END ;
+    IF n <= 4 THEN x := ROR(y + b MOD 10H, 4) ELSE x := ASR(ROR(y + b, 7), n-7) END
+  END ReadNum;
+        
+  (*---------------------------Write---------------------------*)
+
+  PROCEDURE WriteByte*(VAR r: Rider; x: BYTE);
+    VAR f: File; buf: Buffer;
+  BEGIN
+    IF r.apos # r.buf.apos THEN r.buf := GetBuf(r.file, r.apos); END ;
+    IF r.bpos >= r.buf.lim THEN
+      IF r.bpos < SS THEN
+        INC(r.buf.lim); INC(r.file.bleng); r.file.modH := TRUE
+      ELSE f := r.file; WriteBuf(f, r.buf); INC(r.apos); buf := Buf(r.file, r.apos);
+        IF buf = NIL THEN
+          IF r.apos <= f.aleng THEN ReadBuf(f, r.buf, r.apos)
+          ELSE r.buf.apos := r.apos; r.buf.lim := 1; f.aleng := f.aleng + 1; f.bleng := 1; f.modH := TRUE;
+          END
+        ELSE r.buf := buf
+        END ;
+        r.bpos := 0
+      END
+    END ;
+    r.buf.data[r.bpos] := x; INC(r.bpos); r.buf.mod := TRUE
+  END WriteByte;
+
+  PROCEDURE WriteBytes*(VAR r: Rider; x: ARRAY OF BYTE; n: INTEGER);
+    VAR i: INTEGER;
+  BEGIN i := 0; (*this implementation is to be improed*)
+    WHILE i < n DO WriteByte(r, x[i]); INC(i) END
+  END WriteBytes;
+
+  PROCEDURE Write*(VAR r: Rider; ch: CHAR);
+    VAR f: File; buf: Buffer;
+  BEGIN (*same as WriteByte*)
+    IF r.apos # r.buf.apos THEN r.buf := GetBuf(r.file, r.apos); END ;
+    IF r.bpos >= r.buf.lim THEN
+      IF r.bpos < SS THEN
+        INC(r.buf.lim); INC(r.file.bleng); r.file.modH := TRUE
+      ELSE f := r.file; WriteBuf(f, r.buf); INC(r.apos); buf := Buf(r.file, r.apos);
+        IF buf = NIL THEN
+          IF r.apos <= f.aleng THEN ReadBuf(f, r.buf, r.apos)
+          ELSE r.buf.apos := r.apos; r.buf.lim := 1; f.aleng := f.aleng + 1; f.bleng := 1; f.modH := TRUE;
+          END
+        ELSE r.buf := buf
+        END ;
+        r.bpos := 0
+      END
+    END ;
+    r.buf.data[r.bpos] := ORD(ch); INC(r.bpos); r.buf.mod := TRUE
+  END Write;
+
+  PROCEDURE WriteInt*(VAR R: Rider; x: INTEGER);
+  BEGIN WriteByte(R, x MOD 100H);
+    WriteByte(R, x DIV 100H MOD 100H);
+    WriteByte(R, x DIV 10000H MOD 100H);
+    WriteByte(R, x DIV 1000000H MOD 100H)
+  END WriteInt;
+
+  PROCEDURE WriteSet*(VAR R: Rider; s: SET);
+  BEGIN WriteInt(R, ORD(s))
+  END WriteSet;
+
+  PROCEDURE WriteReal*(VAR R: Rider; x: REAL);
+  BEGIN  WriteInt(R, ORD(x))
+  END WriteReal;
+
+  PROCEDURE WriteString*(VAR R: Rider; x: ARRAY OF CHAR);
+    VAR i: INTEGER; ch: CHAR;
+  BEGIN i := 0;
+    REPEAT ch := x[i]; Write(R, ch); INC(i) UNTIL ch = 0X
+  END WriteString;
+
+  PROCEDURE WriteNum*(VAR R: Rider; x: INTEGER);
+  BEGIN
+    WHILE (x < -40H) OR (x >= 40H) DO WriteByte(R, x MOD 80H + 80H); x := ASR(x, 7) END ;
+    WriteByte(R, x MOD 80H)
+  END WriteNum;
+
+  (*---------------------------System use---------------------------*)
+
+  PROCEDURE Init*;
+    VAR i, len: INTEGER;
+  BEGIN root := 0; Kernel.Init; FileDir.Init;
+    SYSTEM.PUT(SYSTEM.ADR(FileCall), SYSTEM.ADR($55 89E5 B850000000 8B5D10 CD40 8B4D08 8919 5D C20C00 6690$));
+    SYSTEM.PUT(SYSTEM.ADR(GetCWD), SYSTEM.ADR($55 89E5 B81E000000 BB05000000 8B4D10 8B550C 8B7508 CD40 5D C20C00$));
+    len := GetCWD(SYSTEM.ADR(hostpath), FullLength, 3);
+    ASSERT((len > 0) & (len < FullLength));
+    IF (len >= 2) & (hostpath[len-2] # "/") THEN
+      hostpath[len-1] := "/"; hostpath[len] := 0X
+    END
+  END Init;
+
+  PROCEDURE RestoreList*; (*after mark phase of garbage collection*)
+    VAR f, f0: INTEGER;
+
+    PROCEDURE mark(f: INTEGER): INTEGER;
+      VAR m: INTEGER;
+    BEGIN
+      IF f = 0 THEN m := -1 ELSE SYSTEM.GET(f-4, m) END ;
+      RETURN m
+    END mark;
+
+    PROCEDURE close(p: INTEGER);
+      VAR f: File; par: FilePar; res, count: INTEGER;
+    BEGIN f := SYSTEM.VAL(File, p);
+      IF f.name[0] = 0X THEN (*delete temp file*)
+        par.fn := 8; par.offset := 0; par.flags := 0; par.size := 0; par.data := 0;
+        par.enc := 3; par.path := SYSTEM.ADR(f.fullname);
+        res := FileCall(par, count)
+      END
+    END close;
+
+  BEGIN (*field "next" has offset 0*)
+    WHILE mark(root) = 0 DO close(root); SYSTEM.GET(root, root) END ;
+    f := root;
+    WHILE f # 0 DO
+      f0 := f; SYSTEM.GET(f0, f0);
+      WHILE mark(f0) = 0 DO close(f0); SYSTEM.GET(f0, f0) END;
+      SYSTEM.PUT(f, f0); f := f0
+    END
+  END RestoreList;
+
+END Files.
