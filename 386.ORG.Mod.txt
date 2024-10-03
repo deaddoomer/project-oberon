@@ -59,6 +59,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     tdx, strx: LONGINT;
     entry: LONGINT;   (*main entry point*)
     FH: LONGINT;  (*available fpu registers ST[0] ... ST[H-1]*)
+    HReg: LONGINT;
     parblocksize, procA, procB: LONGINT;
     fixorgP, fixorgD, fixorgT: LONGINT;   (*origins of lists of locations to be fixed up by loader*)
     check: BOOLEAN;  (*emit run-time checks*)
@@ -199,14 +200,26 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   PROCEDURE GetReg(hint: SET): INTEGER;
     VAR reg: INTEGER; excl: SET;
   BEGIN excl := usedRegs + reservedRegs;
+    IF HReg # NoReg THEN EXCL(hint, HReg) END;
     reg := AX; WHILE (reg <= DI) & ((reg IN excl) OR ~(reg IN hint)) DO INC(reg) END;
     IF reg > DI THEN
       reg := AX; WHILE (reg <= DI) & (reg IN excl) DO INC(reg) END;
       IF reg > DI THEN ORS.Mark("too many regs in use"); reg := AX END;
     END;
     INCL(usedRegs, reg);
+    IF reg = HReg THEN HReg := NoReg END;
     RETURN reg
   END GetReg;
+
+  PROCEDURE GetReg1(hint, excl: SET): INTEGER;
+    VAR reg: INTEGER;
+  BEGIN
+    reg := GetReg(hint - excl);
+    IF reg IN excl THEN
+      ORS.Mark("too many regs in use"); reg := AX
+    END;
+    RETURN reg
+  END GetReg1;
 
   PROCEDURE FreeReg(reg: INTEGER);
   BEGIN
@@ -228,10 +241,8 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     VAR temp: INTEGER; set: SET;
   BEGIN ASSERT(reg IN {AX..DI}); ASSERT(reg IN workset);
     IF reg IN usedRegs THEN
-      temp := 0; set := reservedRegs + usedRegs + workset;
-      WHILE (temp < 8) & (temp IN set) DO INC(temp) END;
-      IF temp >= 8 THEN ORS.Mark("too many regs in use"); temp := AX END;
-      INCL(usedRegs, temp); Gen2(8BH, temp, reg); info := temp (*mov i,reg*)
+      temp := GetReg1(regs, reservedRegs + usedRegs + workset);
+      Gen2(8BH, temp, reg); info := temp (*mov i,reg*)
     ELSE INCL(usedRegs, reg); info := reg
     END
   END SaveReg;
@@ -443,9 +454,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       Gen3v(89H, r, x) (*mov x,r*)
     ELSE
       IF (x.type.size = 1) & (r IN {SP..DI}) THEN (*must be AL, BL, CL, DL*)
-        temp := GetReg({AX});
-        IF temp IN {SP..DI} THEN ORS.Mark("too many regs in use") END;
-        Gen2(8BH, temp, r);
+        temp := GetReg1({AX}, {SP..DI}); Gen2(8BH, temp, r);
         IF freeReg THEN FreeReg(r) END;
         r := temp; freeReg := TRUE
       END;
@@ -679,9 +688,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     ELSIF (x.mode = Reg) & (y.mode IN {ORB.Var, ORB.Par, RegI, RegJ, RegX, RegY}) THEN
       IF y.type.size = 1 THEN
         IF x.r IN {SP..DI} THEN
-          reg := GetReg(regs - {SP..DI});
-          IF reg IN {SP..DI} THEN ORS.Mark("too many regs in use") END;
-          mov(reg, x); Gen3v(3AH, reg, y); FreeReg(reg) (* cmp reg8,r/m8 *)
+          reg := GetReg1(regs, {SP..DI}); mov(reg, x); Gen3v(3AH, reg, y); FreeReg(reg) (*cmp reg8,r/m8*)
         ELSE Gen3v(3AH, x.r, y) (* cmp reg8,r/m8 *)
         END
       ELSE Gen3v(3BH, x.r, y) (* cmp reg32,r/m32 *)
@@ -689,9 +696,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     ELSIF (x.mode IN {ORB.Var, ORB.Par, RegI, RegJ, RegX, RegY}) & (y.mode = Reg) THEN
       IF x.type.size = 1 THEN
         IF y.r IN {SP..DI} THEN
-          reg := GetReg(regs - {SP..DI});
-          IF reg IN {SP..DI} THEN ORS.Mark("too many regs in use") END;
-          mov(reg, y); Gen3v(38H, reg, x); FreeReg(reg) (* cmp r/m8,reg8 *)
+          reg := GetReg1(regs, {SP..DI}); mov(reg, y); Gen3v(38H, reg, x); FreeReg(reg) (*cmp r/m8,reg8*)
         ELSE Gen3v(38H, y.r, x)
         END
       ELSE Gen3v(39H, y.r, x) (* cmp r/m32,reg32 *)
@@ -1222,6 +1227,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   PROCEDURE DivOp*(op: LONGINT; VAR x, y: Item);   (* x := x op y *)
     VAR e, r: LONGINT; positive, popax, popdx: BOOLEAN;
   BEGIN
+    HReg := NoReg;
     positive := (x.mode = ORB.Const) & (x.a >= 0);
     IF (y.mode = ORB.Const) & (y.a <= 0) THEN
       IF op = ORS.div THEN ORS.Mark("bad divisor") ELSE ORS.Mark("bad modulus") END
@@ -1234,14 +1240,10 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     ELSIF ~check & positive & (y.mode IN {ORB.Var, ORB.Par, RegI, RegJ, RegX, RegY}) THEN
       IF y.mode IN {RegI, RegJ, RegX, RegY} THEN
         IF y.r IN {AX, DX} THEN
-          r := GetReg(regs - {AX, DX});
-          IF r IN {AX, DX} THEN ORS.Mark("too many regs in use") END;
-          Gen2(8BH, r, y.r); FreeReg(y.r); y.r := r
+          r := GetReg1(regs, {AX, DX}); Gen2(8BH, r, y.r); FreeReg(y.r); y.r := r
         END;
         IF (y.mode IN {RegX, RegY}) & (y.index IN {AX, DX}) THEN
-          r := GetReg(regs - {AX, DX});
-          IF r IN {AX, DX} THEN ORS.Mark("too many regs in use") END;
-          Gen2(8BH, r, y.index); FreeReg(y.index); y.index := r
+          r := GetReg1(regs, {AX, DX}); Gen2(8BH, r, y.index); FreeReg(y.index); y.index := r
         END
       END;
       load(x, {AX}); popax := FALSE; popdx := FALSE;
@@ -1796,6 +1798,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   PROCEDURE Enter*(parblksize, locblksize: LONGINT; int: BOOLEAN);
   BEGIN
     procA := pc;
+    HReg := NoReg;
     parblocksize := parblksize;
     locblksize := -(locblksize+3) DIV 4 * 4;
     Gen1(50H + BP); (*push ebp*)
@@ -1821,6 +1824,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
     ELSIF parblocksize # 0 THEN Gen1(0C2H); GenShort(parblocksize) (*ret size*)
     ELSE Gen1(0C3H) (*ret*)
     END ;
+    HReg := NoReg;
     AlignCode(4)
   END Return;
 
@@ -2027,7 +2031,26 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   END SBC;
 
   PROCEDURE UML*(VAR x, y: Item);
-  BEGIN mul(x, y, regs)
+    VAR popax, popdx: BOOLEAN; r: INTEGER;
+  BEGIN load(x, {AX}); load(y, regs - {AX}); popax := FALSE; popdx := FALSE;
+    IF y.r = AX THEN
+      xchg(x.r, y.r); r := x.r; x.r := y.r; y.r := r
+    ELSIF x.r # AX THEN
+      IF AX IN usedRegs THEN Gen1(50H + AX); popax := TRUE END;
+      Gen2(08BH, AX, x.r); FreeReg(x.r); x.r := AX; INCL(usedRegs, AX)
+    END;
+    IF (DX IN usedRegs) & (y.r # DX) THEN (*allow y as DX*)
+      Gen1(50H + DX); popdx := TRUE
+    END;
+    INCL(usedRegs, DX); (*prevent DX allocation*)
+    Gen2(0F7H, 4, y.r); (*mul*)
+    IF popdx THEN
+      r := GetReg(regs); Gen2(8BH, r, DX); Gen1(58H + DX); FreeReg(r); FreeItem(y); HReg := r
+    ELSE
+      IF y.r # DX THEN FreeReg(DX) END;
+      FreeItem(y); HReg := DX
+    END;
+    IF popax THEN r := GetReg(regs); Gen2(8BH, r, AX); Gen1(58H + AX); x.r := r END
   END UML;
 
   PROCEDURE Bit*(VAR x, y: Item);
@@ -2062,11 +2085,11 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       Gen3(8DH, SP, SP, -8, anyoffset); (*push a; pushb*)
       Trap(ccTrue, 254); INCL(usedRegs, AX); x.mode := Reg; x.r := AX;
       IF AX IN set THEN
-        reg := GetReg(regs - set);
-        IF reg IN set THEN ORS.Mark("too may regs in use") END;
-        mov(reg, x); x.r := reg; EXCL(usedRegs, AX)
+        reg := GetReg1(regs, set); mov(reg, x); x.r := reg; EXCL(usedRegs, AX)
       END;
       RestoreRegs(set)
+    ELSIF HReg # NoReg THEN
+      x.mode := Reg; x.r := HReg; INCL(usedRegs, HReg)
     ELSE ORS.Mark("remainder not available")
     END
   END H;
@@ -2085,7 +2108,7 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   END Condition;
 
   PROCEDURE Open*(v: INTEGER);
-  BEGIN pc := 0; tdx := 0; strx := 0; usedRegs := reservedRegs; FH := 0; fixorgP := 0; fixorgD := 0; fixorgT := 0; check := v # 0; version := 10
+  BEGIN pc := 0; tdx := 0; strx := 0; usedRegs := reservedRegs; FH := 0; HReg := NoReg; fixorgP := 0; fixorgD := 0; fixorgT := 0; check := v # 0; version := 10
   END Open;
 
   PROCEDURE SetDataSize*(dc: LONGINT);
