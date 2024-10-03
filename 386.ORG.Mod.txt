@@ -1928,13 +1928,13 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
       IF check THEN Trap(ccL, 3) END;
       Gen1(JccD8 + ccE); pc0 := pc; GenByte(0)
     END ;
-    IF x.r # DI THEN SaveReg(DI, {CX, SI, DI}, saveDI); mov(DI, x) END;
-    IF y.r # SI THEN SaveReg(SI, {CX, SI, DI}, saveSI); mov(SI, y) END;
+    IF x.r # SI THEN SaveReg(SI, {CX, SI, DI}, saveSI); mov(SI, x) END;
+    IF y.r # DI THEN SaveReg(DI, {CX, SI, DI}, saveDI); mov(DI, y) END;
     IF z.r # CX THEN SaveReg(CX, {CX, SI, DI}, saveCX); mov(CX, z) END;
     Gen1(0F3A5H); (*rep movsd*)
-    IF x.r # DI THEN RestoreReg(DI, saveDI) END;
-    IF y.r # SI THEN RestoreReg(SI, saveSI) END;
     IF z.r # CX THEN RestoreReg(CX, saveCX) END;
+    IF y.r # DI THEN RestoreReg(DI, saveDI) END;
+    IF x.r # SI THEN RestoreReg(SI, saveSI) END;
     FreeReg(z.r); FreeReg(y.r); FreeReg(x.r);
     IF pc0 # 0 THEN PutByte(pc0, pc - (pc0 + 1)) END
   END Copy;
