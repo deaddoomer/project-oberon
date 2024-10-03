@@ -1417,9 +1417,9 @@ MODULE ORG; (* SVP, 25.7.2024  Oberon compiler; code generator for Intel 386/387
   END Set;
 
   PROCEDURE In*(VAR x, y: Item);  (* x := x IN y *)
-  BEGIN load(y, regs);
-    IF x.mode = ORB.Const THEN Gen2(0FBAH, 4, y.r); GenByte(x.a); FreeReg(y.r) (*bt y,x*)
-    ELSE load(x, regs); Gen2(0FA3H, x.r, y.r); FreeReg(x.r); FreeReg(y.r) (*bt y,x*)
+  BEGIN loadMemReg(y, 4, regs);
+    IF x.mode = ORB.Const THEN Gen3v(0FBAH, 4, y); GenByte(x.a); FreeItem(y) (*bt y,x*)
+    ELSE load(x, regs); Gen3v(0FA3H, x.r, y); FreeReg(x.r); FreeItem(y) (*bt y,x*)
     END;
     SetCC(x, ccB)
   END In;
