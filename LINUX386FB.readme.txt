@@ -1,4 +1,4 @@
-Revised Oberon for Linux/386
+Project Oberon for Linux/386
 
 System requirements:
 - Linux kernel 3.11 or newer
@@ -17,11 +17,11 @@ Boot the System:
 4. Use command Host.Exit to shutdown Oberon System and return to Linux
 
 Bugs:
-- Oberon doesn't leave graphics mode on crash, so you machine might be locked.
-  In such case press Alt+SysRq+r to unlock console.
-  Command `chvt` can be used too when you have remote access to this machine.
-- Oberon currently doesn't implement any kind of interrupt key.
-  Use Alt+SysRq+k when you fall into infinity loop. This will kill Oberon process and unlock virtual console.
+- Oberon doesn't leave graphics mode on crash, so you machine might be locked
+  In such case press Alt+SysRq+r to unlock console
+  Command `chvt` can be used too when you have remote access to this machine
+- Oberon currently doesn't implement any kind of interrupt key
+  Use Alt+SysRq+k when you fall into infinity loop. This will kill Oberon process and unlock virtual console
 - Like Oberon for RISC, this version didn't provide stack overflow protection. Do not run infinity recusion :)
 - Long running system may work unstable after 32-bit timer overflow
 
@@ -31,20 +31,21 @@ Platform specific issues:
 - FileDir/Files operates only with oberon file names at current work directory
 - FileDir.Enumerate didn't sort file names
 - By default used 80-bit prescission for intermediate real calculations
+- SYSTEM.H(1) currently always return 0
 
 Compiler specific issues / difference with RISC5:
-- Generated code compatible with generic 386 processor operated in linear protected mode
+- Generated code compatible with generic 386 processor operated in 32-bit protected mode with linear memory model
 - FPU required only when REAL data type in use
-- UML produce 32-bit result on 386
-- LED generate trap 255
-- MODULE* disable any compiler-generated traps
-- PROCEDURE* generate iret instruction
+- UML produce 64-bit value, through highter half result must be saved as soon as possible due to there is no dedicated register for this purpose
+- LED generate trap 255 and must be handled by trap handler
+- MODULE* disable any compiler-generated traps (range and nil checks)
+- PROCEDURE* generate IRET instruction on RETURN
 - SYSTEM.REG/SYSTEM.LDREG accept register numbers:
     0: EAX  1: ECX  2: EDX  3: ECX  4: ESP  5: EBP  6: ESI  7:  EDI
 - SYSTEM.LDPSR(0) generate CLI
 - SYSTEM.LDPSR(1) generate STI
-- SYSTEM.H(0) (remainder) not available on 386
-- SYSTEM.H(1) (cpu revision) generate trap 254
+- SYSTEM.H(0) (remainder) available only for UML function
+- SYSTEM.H(1) (cpu revision) generates trap 254 and must be handled by trap handler
 - SYSTEM.COND accept numbers:
     0: O  1: NO  2: B   3: AE   4: E    5: NE    6: BE   7: A
     8: S  9: NS  10: P  11: NP  12: L  13: GE  14: LE  15: G
@@ -56,7 +57,7 @@ Compiler specific issues / difference with RISC5:
     trapnum = c MOD 100H; textpos = c DIV 100H MOD 1000000H;
   address of trap handler fixed by loader
 - Internal calling convention:
-  1. Registers used by caller must be saved by caller
+  1. Registers used by caller must be saved by caller itself
   2. Parameters pushed from left to right
       For RECORD/ARRAY push address, than tag/length
   3. REAL result stored in ST0, otherwise in EAX
