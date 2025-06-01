@@ -142,11 +142,11 @@ MODULE FileDir;   (*NW 12.1.86 / 23.8.90 / 15.8.2013*)
               IF (ch = 0X) & (Check(name) = 0) THEN
                 proc(name, -1, continue)
               END
-            END;
-            INC(i)
+            END
           END
-        ELSE continue := FALSE; ASSERT(FALSE)
-        END
+        ELSE continue := FALSE
+        END;
+        INC(i)
       END
     END
   END Enumerate;
