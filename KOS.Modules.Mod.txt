@@ -236,10 +236,11 @@ MODULE Modules;  (*Link and load on Linux/386; NW 20.10.2013 / 8.1.2019*)
   BEGIN
     SYSTEM.PUT(SYSTEM.ADR(Exit), SYSTEM.ADR($B8FFFFFFFF CD40$));
     SYSTEM.PUT(SYSTEM.ADR(WriteChar), SYSTEM.ADR($55 89E5 B83F000000 BB01000000 8B4D08 CD40 5D C20400 90$));
-    s := "load error: Oberon "; s[19] := CHR(res + 30H); s[20] := 0X;
-    FOR i := 0 TO 20 DO WriteChar(s[i]) END;
-    i := 0; WHILE s[i] # 0X DO WriteChar(s[i]); INC(i) END; WriteChar(" ");
-    i := 0; WHILE importing[i] # 0X DO WriteChar(importing[i]); INC(i) END; WriteChar(0AX);
+    s := "load error: ";
+    FOR i := 0 TO 11 DO WriteChar(s[i]) END;
+    i := 0; WHILE importing[i] # 0X DO WriteChar(importing[i]); INC(i) END;
+    WriteChar(" "); WriteChar("("); WriteChar(CHR(res + 30H)); WriteChar(")");
+    WriteChar(0DX); WriteChar(0AX);
     Exit
   END Abort;
 
