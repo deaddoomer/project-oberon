@@ -15,8 +15,8 @@ MODULE ORL;
     dyntab = (strtab + 30 + LibDLSize + 3) DIV 4 * 4;
     hashtab = dyntab + 8*11;
     symtab = hashtab + 4*8;
-    bootinfo = symtab + 16*5;
 
+    BootInfoSize = 32; BootCodeSize = 18;
     MTSize = 64; ModLim = 80000H;
 
   TYPE
@@ -41,7 +41,7 @@ MODULE ORL;
     AllocPtr, res: INTEGER;
     importing, imported: ModuleName;
     m: Memory;
-    entry, org, MTOrg, limit: INTEGER;
+    bootinfo, entry, org, MTOrg, limit: INTEGER;
 
   PROCEDURE Put1 (a: INTEGER; ch: CHAR);
   BEGIN m.x[a-org] := ORD(ch)
@@ -262,13 +262,9 @@ MODULE ORL;
   BEGIN Files.WriteByte(R, x); Files.WriteByte(R, x DIV 256)
   END WriteShort;
 
-  PROCEDURE WriteElf(M: Module);
+  PROCEDURE WriteElf(VAR R: Files.Rider);
     VAR i, len: INTEGER;
-      filename: ModuleName;
-      F: Files.File;
-      R: Files.Rider;
-  BEGIN MakeFileName(filename, M.name, ".elf");
-    F := Files.New(filename); Files.Set(R, F, 0);
+  BEGIN
     Files.WriteInt(R, 464C457FH); (* signature *)
     Files.WriteInt(R, 00010101H); (* 32bit, little endian, elf v1, sysv *)
     Files.WriteInt(R, 0); Files.WriteInt(R, 0); (* pad *)
@@ -295,36 +291,11 @@ MODULE ORL;
     Files.WriteInt(R, limit - ImageBase); (* image size in memory *)
     Files.WriteInt(R, 7); (* flags: rwx *)
     Files.WriteInt(R, 4096); (* align *)
-    (* boot code *)
-    ASSERT(Files.Pos(R) = entry - ImageBase);
-    Files.WriteByte(R, 6AH); Files.WriteByte(R, 0); (* push 0 *)
-    Files.WriteByte(R, 0B8H + MT); Files.WriteInt(R, MTOrg); (* mov MT,MTOrg *)
-    Files.WriteByte(R, 0E9H); Files.WriteInt(R, M.body - (entry + 12)); (* jmp entry *)
-    i := 0; len := org - ImageBase - Files.Pos(R);
-    WHILE i < len DO Files.WriteByte(R, 90H); INC(i) END; (*pad*)
-    ASSERT(Files.Pos(R) = org - ImageBase);
-    Put4(org+0, entry); (* MTOrg-32: Soft reset vector *)
-    Put4(org+4, 0); (* MTOrg-28: Interrupt vector *)
-    Put4(org+8, 0); (* MTOrg-24: ??? *)
-    Put4(org+12, limit); (* MTOrg-20: The limit of available memory *)
-    Put4(org+16, AllocPtr); (* MTOrg-16: The address of the end of the module space loaded  *)
-    Put4(org+20, root.adr); (* MTOrg-12: The current root of the links of loaded modules *)
-    Put4(org+24, limit); (* MTOrg-8: The current limit of the module area *)
-    Put4(org+28, 0); (* MTOrg-4: ? *)
-    i := 0; len := AllocPtr - org;
-    WHILE i < len DO Files.WriteByte(R, m.x[i]); INC(i) END;
-    Files.Register(F);
-    Texts.WriteString(W, filename); Texts.WriteString(W, " linked");
-    Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
   END WriteElf;
 
-  PROCEDURE WriteElfDyn(M: Module);
+  PROCEDURE WriteElfDyn(VAR R: Files.Rider);
     VAR i, len: INTEGER;
-      filename: ModuleName;
-      F: Files.File;
-      R: Files.Rider;
-  BEGIN MakeFileName(filename, M.name, ".elf");
-    F := Files.New(filename); Files.Set(R, F, 0);
+  BEGIN
     Files.WriteInt(R, 464C457FH); (* signature *)
     Files.WriteInt(R, 00010101H); (* 32bit, little endian, elf v1, sysv *)
     Files.WriteInt(R, 0); Files.WriteInt(R, 0); (* pad *)
@@ -428,18 +399,34 @@ MODULE ORL;
     Files.WriteInt(R, 24); (*dlsym*)
     Files.WriteInt(R, 0);
     Files.WriteInt(R, 0);
-    Files.WriteInt(R, 18);
+    Files.WriteInt(R, 18)
+  END WriteElfDyn;
+
+  PROCEDURE WriteCode(M: Module; static: BOOLEAN);
+    VAR i, len: INTEGER;
+      filename: ModuleName;
+      F: Files.File;
+      R: Files.Rider;
+  BEGIN MakeFileName(filename, M.name, ".elf");
+    F := Files.New(filename); Files.Set(R, F, 0);
+    (* elf header *)
+    IF ~static THEN WriteElfDyn(R) ELSE WriteElf(R) END;
     (* boot info *)
     ASSERT(Files.Pos(R) = bootinfo - ImageBase);
     Files.WriteInt(R, 0); (* dlopen *)
     Files.WriteInt(R, 0); (* dlsym *)
     Files.WriteInt(R, 0); (* dlerror *)
     Files.WriteInt(R, 0); (* dlclose *)
+    Files.WriteInt(R, 0); (* stackOrg *)
+    Files.WriteInt(R, 0);
+    Files.WriteInt(R, 0);
+    Files.WriteInt(R, 0);
     (* boot code *)
     ASSERT(Files.Pos(R) = entry - ImageBase);
+    Files.WriteByte(R, 89H); Files.WriteByte(R, 25H); Files.WriteInt(R, bootinfo + 16); (* mov [bootinfo.stackOrg],esp *)
     Files.WriteByte(R, 6AH); Files.WriteByte(R, 0); (* push 0 *)
     Files.WriteByte(R, 0B8H + MT); Files.WriteInt(R, MTOrg); (* mov MT,MTOrg *)
-    Files.WriteByte(R, 0E9H); Files.WriteInt(R, M.body - (entry + 12)); (* jmp entry *)
+    Files.WriteByte(R, 0E9H); Files.WriteInt(R, M.body - (entry + BootCodeSize)); (* jmp entry *)
     i := 0; len := org - ImageBase - Files.Pos(R);
     WHILE i < len DO Files.WriteByte(R, 90H); INC(i) END; (*pad*)
     ASSERT(Files.Pos(R) = org - ImageBase);
@@ -456,7 +443,7 @@ MODULE ORL;
     Files.Register(F);
     Texts.WriteString(W, filename); Texts.WriteString(W, " linked");
     Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
-  END WriteElfDyn;
+  END WriteCode;
 
   PROCEDURE Link*;
     VAR beg, end, time: INTEGER;
@@ -472,8 +459,8 @@ MODULE ORL;
     END;
 
     (* target specific *)
-    IF static THEN entry := ImageBase + 52 + 32 ELSE entry := bootinfo + 4*4 END;
-    org := (entry + 12 + 15) DIV 16 * 16;
+    IF static THEN bootinfo := ImageBase + 52 + 32 ELSE bootinfo := symtab + 16*5 END;
+    entry := bootinfo + BootInfoSize; org := (entry + BootCodeSize + 15) DIV 16 * 16;
     MTOrg := org + 20H; limit := org + ModLim;
     AllocPtr := MTOrg + 4*MTSize;
 
@@ -491,7 +478,7 @@ MODULE ORL;
       END
     END;
     IF res = 0 THEN
-      IF ~static THEN WriteElfDyn(M) ELSE WriteElf(M) END
+      WriteCode(M, static)
     ELSE
       Texts.WriteString(W, "link error: "); Texts.WriteString(W, importing);
       IF res = 1 THEN Texts.WriteString(W, " module not found")
@@ -511,7 +498,7 @@ MODULE ORL;
   PROCEDURE Load*;
   END Load;
 
-BEGIN Texts.OpenWriter(W); Texts.WriteString(W, "OR386 Linker  04.12.2025");
+BEGIN Texts.OpenWriter(W); Texts.WriteString(W, "OR386 Linker  05.12.2025");
   Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
 END ORL.
 
