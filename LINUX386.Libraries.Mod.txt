@@ -1,0 +1,39 @@
+MODULE Libraries;
+  IMPORT SYSTEM, Modules;
+
+  CONST
+    lazy = 0; now = 1; global = 8;
+
+  VAR
+    dlopen:  PROCEDURE (*cdecl*) (flags, filename: INTEGER): INTEGER; (*reversed*)
+    dlsym:   PROCEDURE (*cdecl*) (name, handle: INTEGER): INTEGER;
+    dlclose: PROCEDURE (*cdecl*) (handle: INTEGER)(*: INTEGER*);
+
+  PROCEDURE Load* (name: ARRAY OF CHAR; VAR dll: INTEGER);
+  BEGIN IF dlopen # NIL THEN dll := dlopen(ORD({now, global}), SYSTEM.ADR(name[0])) ELSE dll := 0 END
+  END Load;
+
+  PROCEDURE ThisProc* (dll: INTEGER; name: ARRAY OF CHAR): INTEGER;
+    VAR code: INTEGER;
+  BEGIN
+    IF dlsym # NIL THEN code := dlsym(SYSTEM.ADR(name[0]), dll) ELSE code := 0 END;
+    RETURN code
+  END ThisProc;
+
+  PROCEDURE Free* (dll: INTEGER);
+  BEGIN IF dlclose # NIL THEN dlclose(dll) END
+  END Free;
+
+  PROCEDURE Init;
+    VAR p: INTEGER;
+  BEGIN
+    SYSTEM.GET(Modules.MTOrg - 32 + 8, p);
+    IF p # 0 THEN
+      SYSTEM.GET(p+0, dlopen);
+      SYSTEM.GET(p+4, dlsym);
+      SYSTEM.GET(p+12, dlclose)
+    END
+  END Init;
+
+BEGIN Init
+END Libraries.

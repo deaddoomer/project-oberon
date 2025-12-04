@@ -4,12 +4,20 @@ MODULE ORL;
   CONST
     versionkey = 0AX; MT = 3; DescSize = 80;
 
+    Interpreter = "/lib/ld-linux.so.2"; InterpreterSize = 19;
+    LibDL = "libdl.so.2"; LibDLSize = 11;
+
     ImageBase = 100000H;
-    entry = ImageBase + 52 + 32;
-    org = (entry + 12 + 15) DIV 16 * 16;
+    phdr = ImageBase + 52;
+    reltab = phdr + 32*3;
+    interp = reltab + 8*4;
+    strtab = interp + InterpreterSize;
+    dyntab = (strtab + 30 + LibDLSize + 3) DIV 4 * 4;
+    hashtab = dyntab + 8*11;
+    symtab = hashtab + 4*8;
+    bootinfo = symtab + 16*5;
 
     MTSize = 64; ModLim = 80000H;
-    MTOrg = org + 20H; limit = org + ModLim;
 
   TYPE
     Module = POINTER TO ModDesc;
@@ -33,6 +41,7 @@ MODULE ORL;
     AllocPtr, res: INTEGER;
     importing, imported: ModuleName;
     m: Memory;
+    entry, org, MTOrg, limit: INTEGER;
 
   PROCEDURE Put1 (a: INTEGER; ch: CHAR);
   BEGIN m.x[a-org] := ORD(ch)
@@ -309,13 +318,165 @@ MODULE ORL;
     Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
   END WriteElf;
 
+  PROCEDURE WriteElfDyn(M: Module);
+    VAR i, len: INTEGER;
+      filename: ModuleName;
+      F: Files.File;
+      R: Files.Rider;
+  BEGIN MakeFileName(filename, M.name, ".elf");
+    F := Files.New(filename); Files.Set(R, F, 0);
+    Files.WriteInt(R, 464C457FH); (* signature *)
+    Files.WriteInt(R, 00010101H); (* 32bit, little endian, elf v1, sysv *)
+    Files.WriteInt(R, 0); Files.WriteInt(R, 0); (* pad *)
+    WriteShort(R, 2); (* executable *)
+    WriteShort(R, 3); (* 386 *)
+    Files.WriteInt(R, 1); (* elf version *)
+    Files.WriteInt(R, entry); (* entry *)
+    Files.WriteInt(R, 52); (* program table offset *)
+    Files.WriteInt(R, 0); (* section table offset *)
+    Files.WriteInt(R, 0); (* flags *)
+    WriteShort(R, 52); (* elf header size *)
+    WriteShort(R, 32); (* program header entry size *)
+    WriteShort(R, 3); (* program header entry count *)
+    WriteShort(R, 0); (* section entry size *)
+    WriteShort(R, 0); (* section entry count *)
+    WriteShort(R, 0); (* section id for name table *)
+    (* program header *)
+    ASSERT(Files.Pos(R) = 52);
+    Files.WriteInt(R, 1); (* segment load *)
+    Files.WriteInt(R, 0); (* file offset *)
+    Files.WriteInt(R, ImageBase); (* virtual image base *)
+    Files.WriteInt(R, ImageBase); (* physical image base *)
+    Files.WriteInt(R, AllocPtr - ImageBase); (* image size in file *)
+    Files.WriteInt(R, limit - ImageBase); (* image size in memory *)
+    Files.WriteInt(R, 7); (* flags: rwx *)
+    Files.WriteInt(R, 4096); (* align *)
+    (**)
+    Files.WriteInt(R, 2); (* dynamic *)
+    Files.WriteInt(R, dyntab - ImageBase); (* file offset *)
+    Files.WriteInt(R, dyntab); (* virtual image base *)
+    Files.WriteInt(R, dyntab); (* physical image base *)
+    Files.WriteInt(R, entry - dyntab); (* dyntab size in file *)
+    Files.WriteInt(R, entry - dyntab); (* dyntab size in memory *)
+    Files.WriteInt(R, 7); (* flags: rwx *)
+    Files.WriteInt(R, 4); (* align *)
+    (**)
+    Files.WriteInt(R, 3); (* interp *)
+    Files.WriteInt(R, interp - ImageBase); (* file offset *)
+    Files.WriteInt(R, interp); (* virtual image base *)
+    Files.WriteInt(R, interp); (* physical image base *)
+    Files.WriteInt(R, InterpreterSize); (* dyntab size in file *)
+    Files.WriteInt(R, InterpreterSize); (* dyntab size in memory *)
+    Files.WriteInt(R, 7); (* flags: rwx *)
+    Files.WriteInt(R, 1); (* align *)
+    (* relocation table *)
+    ASSERT(Files.Pos(R) = reltab - ImageBase);
+    Files.WriteInt(R, bootinfo+0);  Files.WriteInt(R, 3 * 256 + 1); (* dlopen,  fixup R_386_32 *)
+    Files.WriteInt(R, bootinfo+4);  Files.WriteInt(R, 4 * 256 + 1); (* dlsym,   fixup R_386_32 *)
+    Files.WriteInt(R, bootinfo+8);  Files.WriteInt(R, 2 * 256 + 1); (* dlerror, fixup R_386_32 *)
+    Files.WriteInt(R, bootinfo+12); Files.WriteInt(R, 1 * 256 + 1); (* dlclose, fixup R_386_32 *)
+    (* interp string *)
+    ASSERT(Files.Pos(R) = interp - ImageBase);
+    Files.WriteString(R, Interpreter);
+    ASSERT(Files.Pos(R) = strtab - ImageBase);
+    Files.WriteString(R, "");
+    Files.WriteString(R, "dlclose");
+    Files.WriteString(R, "dlerror");
+    Files.WriteString(R, "dlopen");
+    Files.WriteString(R, "dlsym");
+    Files.WriteString(R, LibDL);
+    i := 0; len := dyntab - ImageBase - Files.Pos(R);
+    WHILE i < len DO Files.WriteByte(R, 00H); INC(i) END; (*pad*)
+    ASSERT(Files.Pos(R) = dyntab - ImageBase);
+    Files.WriteInt(R, 18); Files.WriteInt(R, interp - reltab); (* DT_RELSZ *)
+    Files.WriteInt(R, 19); Files.WriteInt(R, 8); (* DT_RELENT *)
+    Files.WriteInt(R, 17); Files.WriteInt(R, reltab); (* DT_REL *)
+    Files.WriteInt(R, 10); Files.WriteInt(R, dyntab - strtab); (* DT_STRSZ *)
+    Files.WriteInt(R, 5); Files.WriteInt(R, strtab); (* DT_STRTAB *)
+    Files.WriteInt(R, 11); Files.WriteInt(R, 16); (* DT_SYMENT *)
+    Files.WriteInt(R, 6); Files.WriteInt(R, symtab); (* DT_SYMTAB *)
+    Files.WriteInt(R, 4); Files.WriteInt(R, hashtab); (* DT_HSAH *)
+    Files.WriteInt(R, 1); Files.WriteInt(R, 30); (* DT_NEEDED *)
+    Files.WriteInt(R, 24); Files.WriteInt(R, 0); (* DT_BIND_NOW (optional) *)
+    Files.WriteInt(R, 0); Files.WriteInt(R, 0); (* DT_NULL *)
+    ASSERT(Files.Pos(R) = hashtab - ImageBase);
+    Files.WriteInt(R, 1); (* noOfBuckets *)
+    Files.WriteInt(R, 5); (* noOfSymbols *)
+    Files.WriteInt(R, 1); (* bucket 0 *)
+    Files.WriteInt(R, 1); (* chain of bucket 0 *)
+    Files.WriteInt(R, 2);
+    Files.WriteInt(R, 3);
+    Files.WriteInt(R, 4);
+    Files.WriteInt(R, 0);
+    ASSERT(Files.Pos(R) = symtab - ImageBase);
+    Files.WriteInt(R, 0); (**)
+    Files.WriteInt(R, 0);
+    Files.WriteInt(R, 0);
+    Files.WriteInt(R, 0);
+    Files.WriteInt(R, 1); (*dlclose*)
+    Files.WriteInt(R, 0);
+    Files.WriteInt(R, 0);
+    Files.WriteInt(R, 18);
+    Files.WriteInt(R, 9); (*dlerror*)
+    Files.WriteInt(R, 0);
+    Files.WriteInt(R, 0);
+    Files.WriteInt(R, 18);
+    Files.WriteInt(R, 17); (*dlopen*)
+    Files.WriteInt(R, 0);
+    Files.WriteInt(R, 0);
+    Files.WriteInt(R, 18);
+    Files.WriteInt(R, 24); (*dlsym*)
+    Files.WriteInt(R, 0);
+    Files.WriteInt(R, 0);
+    Files.WriteInt(R, 18);
+    (* boot info *)
+    ASSERT(Files.Pos(R) = bootinfo - ImageBase);
+    Files.WriteInt(R, 0); (* dlopen *)
+    Files.WriteInt(R, 0); (* dlsym *)
+    Files.WriteInt(R, 0); (* dlerror *)
+    Files.WriteInt(R, 0); (* dlclose *)
+    (* boot code *)
+    ASSERT(Files.Pos(R) = entry - ImageBase);
+    Files.WriteByte(R, 6AH); Files.WriteByte(R, 0); (* push 0 *)
+    Files.WriteByte(R, 0B8H + MT); Files.WriteInt(R, MTOrg); (* mov MT,MTOrg *)
+    Files.WriteByte(R, 0E9H); Files.WriteInt(R, M.body - (entry + 12)); (* jmp entry *)
+    i := 0; len := org - ImageBase - Files.Pos(R);
+    WHILE i < len DO Files.WriteByte(R, 90H); INC(i) END; (*pad*)
+    ASSERT(Files.Pos(R) = org - ImageBase);
+    Put4(org+0, entry); (* MTOrg-32: Soft reset vector *)
+    Put4(org+4, 0); (* MTOrg-28: Interrupt vector *)
+    Put4(org+8, bootinfo); (* MTOrg-24: ??? *)
+    Put4(org+12, limit); (* MTOrg-20: The limit of available memory *)
+    Put4(org+16, AllocPtr); (* MTOrg-16: The address of the end of the module space loaded  *)
+    Put4(org+20, root.adr); (* MTOrg-12: The current root of the links of loaded modules *)
+    Put4(org+24, limit); (* MTOrg-8: The current limit of the module area *)
+    Put4(org+28, 0); (* MTOrg-4: ? *)
+    i := 0; len := AllocPtr - org;
+    WHILE i < len DO Files.WriteByte(R, m.x[i]); INC(i) END;
+    Files.Register(F);
+    Texts.WriteString(W, filename); Texts.WriteString(W, " linked");
+    Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
+  END WriteElfDyn;
+
   PROCEDURE Link*;
     VAR beg, end, time: INTEGER;
       T: Texts.Text;
       S: Texts.Scanner;
       M: Module;
-  BEGIN M := NIL; NEW(m); NEW(root); AllocPtr := MTOrg + 4*MTSize; res := 0;
+      static: BOOLEAN;
+  BEGIN M := NIL; NEW(m); NEW(root); res := 0;
     Texts.OpenScanner(S, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(S);
+    IF (S.class = Texts.Char) & (S.c = "!") THEN
+      Texts.Scan(S); static := TRUE
+    ELSE static := FALSE
+    END;
+
+    (* target specific *)
+    IF static THEN entry := ImageBase + 52 + 32 ELSE entry := bootinfo + 4*4 END;
+    org := (entry + 12 + 15) DIV 16 * 16;
+    MTOrg := org + 20H; limit := org + ModLim;
+    AllocPtr := MTOrg + 4*MTSize;
+
     IF (S.class = Texts.Char) & (S.c = "^") THEN
       Oberon.GetSelection(T, beg, end, time);
       IF time >= 0 THEN
@@ -330,7 +491,7 @@ MODULE ORL;
       END
     END;
     IF res = 0 THEN
-      WriteElf(M)
+      IF ~static THEN WriteElfDyn(M) ELSE WriteElf(M) END
     ELSE
       Texts.WriteString(W, "link error: "); Texts.WriteString(W, importing);
       IF res = 1 THEN Texts.WriteString(W, " module not found")
@@ -350,7 +511,7 @@ MODULE ORL;
   PROCEDURE Load*;
   END Load;
 
-BEGIN Texts.OpenWriter(W); Texts.WriteString(W, "OR386 Linker  30.08.2024");
+BEGIN Texts.OpenWriter(W); Texts.WriteString(W, "OR386 Linker  04.12.2025");
   Texts.WriteLn(W); Texts.Append(Oberon.Log, W.buf)
 END ORL.
 
