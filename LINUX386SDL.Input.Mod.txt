@@ -1,0 +1,144 @@
+MODULE Input; (*NW 5.10.86 / 15.11.90 Ceres-2; PDR 21.4.12 / NW 15.5.2013 Ceres-4*)
+  IMPORT SYSTEM, Libraries, Host;
+
+  CONST
+    SDLKeyDown = 2; SDLKeyUp = 3;
+    SDLPEEKEVENT = 1;
+
+  TYPE
+    SDLKeyboardEvent = RECORD
+      type, which, state: BYTE;
+      keysym: RECORD
+        scancode: BYTE;
+        sym: INTEGER;
+        mod: SET;
+        lowUnicode, highUnicode: BYTE
+      END;
+      pad: INTEGER
+    END;
+
+  VAR
+    KTabAdr: INTEGER;  (*keyboard code translation table*)
+    MW, MH: INTEGER; (*mouse limits and coords*)
+
+    SDL: INTEGER;
+    SDLGetVideoSurface: PROCEDURE (): INTEGER;
+    SDLPumpEvents: PROCEDURE;
+    sdlGetMouseState: PROCEDURE (*ccall*) (VAR y, x: INTEGER): SET;
+    sdlPeepEvents: PROCEDURE (*ccall*) (mask: SET; action, numevents, events: INTEGER): INTEGER;
+    sdlWaitEvent: PROCEDURE (event: INTEGER): INTEGER;
+    sdlShowCursor: PROCEDURE (*ccall*) (toggle: INTEGER);
+    sdlEnableKeyRepeat: PROCEDURE (*ccall*) (interval, delay: INTEGER);
+
+  PROCEDURE SDLEnableKeyRepeat (delay, interval: INTEGER);
+  BEGIN sdlEnableKeyRepeat(interval, delay)
+  END SDLEnableKeyRepeat;
+
+  PROCEDURE SDLShowCursor (toggle: INTEGER);
+  BEGIN sdlShowCursor(toggle)
+  END SDLShowCursor;
+
+  PROCEDURE SDLPeepEvent (event, action: INTEGER; mask: SET): BOOLEAN;
+  BEGIN RETURN sdlPeepEvents(mask, 1, action, event) = 1
+  END SDLPeepEvent;
+
+  PROCEDURE SDLGetMouseState (VAR x, y: INTEGER): SET;
+  BEGIN RETURN sdlGetMouseState(y, x)
+  END SDLGetMouseState;
+
+  PROCEDURE SDLWaitEventNIL (): BOOLEAN;
+  BEGIN RETURN sdlWaitEvent(0) # 0
+  END SDLWaitEventNIL;
+
+  PROCEDURE SDLWaitEvent (event: INTEGER): BOOLEAN;
+  BEGIN RETURN sdlWaitEvent(event) # 0
+  END SDLWaitEvent;
+
+  PROCEDURE Available*(): INTEGER;
+    VAR ev: SDLKeyboardEvent; ok, Recd: BOOLEAN;
+  BEGIN
+    REPEAT
+      SDLPumpEvents;
+      ok := SDLPeepEvent(SYSTEM.ADR(ev), SDLPEEKEVENT, -{});
+      Recd := ok & (ev.type = SDLKeyDown) & (ev.keysym.sym < 300); (*ignore modifiers*)
+      IF ok & ~Recd THEN Host.PollEvent END
+    UNTIL ~ok OR Recd
+    RETURN ORD(Recd)
+  END Available;
+
+  PROCEDURE Read*(VAR ch: CHAR);
+    VAR ev: SDLKeyboardEvent; char: CHAR; sym, kbdCode: INTEGER; Shift, Ctrl: BOOLEAN;
+  BEGIN
+    REPEAT
+      REPEAT
+        REPEAT UNTIL SDLWaitEventNIL()
+      UNTIL SDLPeepEvent(SYSTEM.ADR(ev), SDLPEEKEVENT, -{});
+      Host.PollEvent;
+    UNTIL (ev.type = SDLKeyDown) & (ev.keysym.sym < 300); (*ignore modifiers*)
+
+    kbdCode := ev.keysym.sym;
+    Shift := (ev.keysym.mod * {0, 1}) # {}; (*shift*)
+    Ctrl := 6 IN ev.keysym.mod; (*ctrl*)
+    IF kbdCode < 128 THEN
+      kbdCode := ev.keysym.sym;
+      IF Shift OR Ctrl THEN INC(kbdCode, 80H) END; (*ctrl implies shift*)
+      SYSTEM.GET(KTabAdr + kbdCode, ch)
+    ELSIF kbdCode = 282 THEN (*f1*)
+      IF Shift OR Ctrl THEN ch := 0X ELSE ch := 1AX END
+    ELSIF kbdCode = 266 THEN (*keypad del*)
+      ch := 7FX (*del*)
+    ELSE ch := 0X
+    END;
+    IF Ctrl THEN ch := CHR(ORD(ch) MOD 20H) END
+  END Read;
+
+  PROCEDURE Mouse*(VAR keys: SET; VAR x, y: INTEGER);
+    VAR bits: SET; Height: INTEGER;
+  BEGIN keys := {}; Height := Available();
+    bits := SDLGetMouseState(x, y);
+    SYSTEM.GET(SDLGetVideoSurface() + 12, Height);
+    IF (*0*) 0 IN bits THEN INCL(keys, 2) END; (*left*)
+    IF (*1*) 2 IN bits THEN INCL(keys, 0) END; (*middle*)
+    IF (*2*) 1 IN bits THEN INCL(keys, 1) END; (*right*)
+    y := Height - y;
+    IF x < 0 THEN x := 0 ELSIF x >= MW THEN x := MW - 1 END;
+    IF y < 0 THEN x := 0 ELSIF y >= MH THEN y := MH - 1 END
+  END Mouse;
+
+  PROCEDURE SetMouseLimits*(w, h: INTEGER);
+  BEGIN MW := w; MH := h
+  END SetMouseLimits;
+
+  PROCEDURE Init*;
+  BEGIN
+    KTabAdr := SYSTEM.ADR($
+      00 00 00 00 00 00 00 00  08 09 00 00 00 0D 00 00
+      00 00 00 00 00 00 00 00  00 00 00 1B 00 00 00 00
+      20 00 00 00 00 00 00 27  00 00 00 00 2C 2D 2E 2F
+      30 31 32 33 34 35 36 37  38 39 00 3B 00 3D 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 5B 5C 5D 00 00
+      60 61 62 63 64 65 66 67  68 69 6A 6B 6C 6D 6E 6F
+      70 71 72 73 74 75 76 77  78 79 7A 00 00 00 00 00
+      00 00 00 00 00 00 00 00  08 09 00 00 00 0D 00 00
+      00 00 00 00 00 00 00 00  00 00 00 1B 00 00 00 00
+      20 00 00 00 00 00 00 22  00 00 00 00 3C 5F 3E 3F
+      29 21 40 23 24 25 5E 26  2A 28 00 3A 00 2B 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 7B 7C 7D 00 00
+      7E 41 42 43 44 45 46 47  48 49 4A 4B 4C 4D 4E 4F
+      50 51 52 53 54 55 56 57  58 59 5A 00 00 00 00 00$);
+    ASSERT(Host.SDL # 0);
+    SYSTEM.PUT(SYSTEM.ADR(SDLGetVideoSurface), Libraries.ThisProc(Host.SDL, "SDL_GetVideoSurface"));
+    SYSTEM.PUT(SYSTEM.ADR(SDLPumpEvents), Libraries.ThisProc(Host.SDL, "SDL_PumpEvents"));
+    SYSTEM.PUT(SYSTEM.ADR(sdlGetMouseState), Libraries.ThisProc(Host.SDL, "SDL_GetMouseState"));
+    SYSTEM.PUT(SYSTEM.ADR(sdlShowCursor), Libraries.ThisProc(Host.SDL, "SDL_ShowCursor"));
+    SYSTEM.PUT(SYSTEM.ADR(sdlPeepEvents), Libraries.ThisProc(Host.SDL, "SDL_PeepEvents"));
+    SYSTEM.PUT(SYSTEM.ADR(sdlWaitEvent), Libraries.ThisProc(Host.SDL, "SDL_WaitEvent"));
+    SYSTEM.PUT(SYSTEM.ADR(sdlEnableKeyRepeat), Libraries.ThisProc(Host.SDL, "SDL_EnableKeyRepeat"));
+    SDLEnableKeyRepeat(500, 30);
+    SDLShowCursor(0)
+  END Init;
+
+BEGIN Init
+END Input.
