@@ -1,5 +1,5 @@
 MODULE Host; (*linux/386 + SDL-1.2*)
-  IMPORT SYSTEM, Libraries;
+  IMPORT SYSTEM, Modules, Libraries;
 
   CONST
     library = "libSDL.so";
@@ -11,10 +11,27 @@ MODULE Host; (*linux/386 + SDL-1.2*)
     (*SDLSetVideoMode*)
     resizable = 4; anyformat = 28;
 
+    (*SDLEvent.type*)
+    SDLKeyDown = 2; SDLKeyUp = 3;
+
+    (*SDLPeepEvent*)
+    peek = 1;
+
   TYPE
     SDLEvent = RECORD
       type, pad0, pad1, pad2: BYTE;
       any: ARRAY 20 OF BYTE;
+    END;
+
+    SDLKeyboardEvent = RECORD
+      type, which, state: BYTE;
+      keysym: RECORD
+        scancode: BYTE;
+        sym: INTEGER;
+        mod: SET;
+        lowUnicode, highUnicode: BYTE
+      END;
+      pad: INTEGER
     END;
 
   VAR
@@ -22,6 +39,10 @@ MODULE Host; (*linux/386 + SDL-1.2*)
     surface, dbuf: INTEGER;
     active: BOOLEAN;
     Base, Width, Height, Pitch: INTEGER;
+    KTabAdr: INTEGER;  (*keyboard code translation table*)
+
+    AbortCommand: PROCEDURE;
+    esp, ebp: INTEGER;
 
     syscall1: PROCEDURE (eax: INTEGER): INTEGER;
     syscall2: PROCEDURE (eax, ebx: INTEGER): INTEGER;
@@ -40,7 +61,15 @@ MODULE Host; (*linux/386 + SDL-1.2*)
     sdlLockSurface: PROCEDURE (*ccall*) (surface: INTEGER): INTEGER;
     sdlUnlockSurface: PROCEDURE (*ccall*) (surface: INTEGER);
     sdlWMSetCaption: PROCEDURE (*ccall*) (icon, title: INTEGER);
+    SDLPumpEvents: PROCEDURE;
+    sdlGetMouseState: PROCEDURE (*ccall*) (VAR y, x: INTEGER): SET;
+    sdlPeepEvents: PROCEDURE (*ccall*) (mask: SET; action, numevents, events: INTEGER): INTEGER;
+    sdlWaitEvent: PROCEDURE (event: INTEGER): INTEGER;
+    sdlShowCursor: PROCEDURE (*ccall*) (toggle: INTEGER);
+    sdlEnableKeyRepeat: PROCEDURE (*ccall*) (interval, delay: INTEGER);
     SDLGetError: PROCEDURE (*ccall*) (): INTEGER;
+
+  (* --------- sdl --------- *)
 
   PROCEDURE SDLInit (flags: SET): INTEGER;
   BEGIN RETURN sdlInit(flags)
@@ -84,34 +113,31 @@ MODULE Host; (*linux/386 + SDL-1.2*)
     RETURN sdlBlitSurface(SYSTEM.ADR(dr), dst, SYSTEM.ADR(sr), src)
   END SDLBlitSurface;
 
-  PROCEDURE SDLPollEvent (VAR ev: SDLEvent): BOOLEAN;
-  BEGIN RETURN sdlPollEvent(SYSTEM.ADR(ev.type)) # 0
+  PROCEDURE SDLPollEvent (ev: INTEGER): BOOLEAN;
+  BEGIN RETURN sdlPollEvent(ev) # 0
   END SDLPollEvent;
 
-  PROCEDURE Quit*(code: INTEGER);
-    VAR res: INTEGER; ok: BOOLEAN;
-  BEGIN
-    res := syscall1(36); (*sync*)
-    IF SDL # 0 THEN SDLQuit; Libraries.Free(SDL); SDL := 0 END;
-    res := syscall2(1, code) (*exit(code)*)
-  END Quit;
+  PROCEDURE SDLEnableKeyRepeat (delay, interval: INTEGER);
+  BEGIN sdlEnableKeyRepeat(interval, delay)
+  END SDLEnableKeyRepeat;
 
-  PROCEDURE Exit*;
-  BEGIN Quit(0)
-  END Exit;
+  PROCEDURE SDLShowCursor (toggle: INTEGER);
+  BEGIN sdlShowCursor(toggle)
+  END SDLShowCursor;
 
-  PROCEDURE Sync*;
-    VAR res: INTEGER;
-  BEGIN res := syscall1(36) (*sync*)
-  END Sync;
+  PROCEDURE SDLPeepEvent (event, action: INTEGER; mask: SET): BOOLEAN;
+  BEGIN RETURN sdlPeepEvents(mask, 1, action, event) = 1
+  END SDLPeepEvent;
 
-  PROCEDURE Abort*;
-    VAR res: INTEGER;
-  BEGIN
-    res := syscall3(37, syscall1(20), 6); (*kill(getpid(), SIGABRT)*)
-    res := syscall2(1, 1); (*exit*)
-    REPEAT UNTIL FALSE
-  END Abort;
+  PROCEDURE SDLGetMouseState (VAR x, y: INTEGER): SET;
+  BEGIN RETURN sdlGetMouseState(y, x)
+  END SDLGetMouseState;
+
+  PROCEDURE SDLWaitEvent (event: INTEGER): BOOLEAN;
+  BEGIN RETURN sdlWaitEvent(event) # 0
+  END SDLWaitEvent;
+
+  (* ------ utility --------- *)
 
   PROCEDURE UnixToClock(t: INTEGER): INTEGER;
     VAR z, era, y, doe, yoe, doy, mp, second, minute, hour, day, month, year: INTEGER;
@@ -168,8 +194,77 @@ MODULE Host; (*linux/386 + SDL-1.2*)
   BEGIN s[0] := 0AX; s[1] := 0X; WriteString(fd, s)
   END WriteLn;
 
+  (* --------- signals --------- *)
+
+  PROCEDURE Abort*;
+  BEGIN
+    REPEAT UNTIL syscall3(37, syscall1(20), 6) # -4; (*kill(getpid(), SIGABRT)*)
+    REPEAT UNTIL syscall2(1, 1) # -4; (*exit*)
+    REPEAT UNTIL FALSE
+  END Abort;
+
+  PROCEDURE Signal; (*void Signal(int sig, struct sigcontext ctx);*)
+  BEGIN
+    SYSTEM.GET(Modules.MTOrg - 32, AbortCommand);
+    IF AbortCommand # NIL THEN
+      SYSTEM.PUT(SYSTEM.REG(5) + 12 + 56, AbortCommand); (*ctx.eip := AbortCommand*)
+    ELSE Abort
+    END;
+  END Signal;
+
+  PROCEDURE InstallSignals;
+    VAR sa: RECORD
+      handler: INTEGER;
+      mask, flags: SET;
+      restorer: INTEGER;
+    END;
+  BEGIN
+    sa.handler := SYSTEM.ADR(Signal);
+    sa.mask := {};
+    sa.flags := {28, 30}; (*SA_RESTART|SA_NODEFER*)
+    sa.restorer := 0;
+    REPEAT UNTIL syscall4(67, 2, SYSTEM.ADR(sa), 0) # -4; (*sigaction(SIGINT, &sa, NULL)*)
+  END InstallSignals;
+
+  PROCEDURE Lock; (*disable aborts before enter sdl*)
+    VAR m: INTEGER;
+  BEGIN
+    REPEAT m := syscall1(68) UNTIL m # -4; (*siggetmask()*)
+    REPEAT UNTIL syscall2(69, ORD(SYSTEM.VAL(SET, m) - {2})) # -4; (*sigsetmask(m-2)*)
+  END Lock;
+
+  PROCEDURE Unlock;
+    VAR m: INTEGER;
+  BEGIN
+    REPEAT m := syscall1(68) UNTIL m # -4; (*siggetmask()*)
+    REPEAT UNTIL syscall2(69, ORD(SYSTEM.VAL(SET, m) + {2})) # -4; (*sigsetmask(m+2)*)
+  END Unlock;
+
+  (* --------- commands --------- *)
+
+  PROCEDURE Quit*(code: INTEGER);
+    VAR res: INTEGER; ok: BOOLEAN;
+  BEGIN
+    Lock;
+    REPEAT UNTIL syscall1(36) # -4; (*sync*)
+    IF SDL # 0 THEN SDLQuit; Libraries.Free(SDL); SDL := 0 END;
+    REPEAT UNTIL syscall2(1, code) # -4; (*exit(code)*)
+    REPEAT UNTIL FALSE
+  END Quit;
+
+  PROCEDURE Exit*;
+  BEGIN Quit(0)
+  END Exit;
+
+  PROCEDURE Sync*;
+  BEGIN REPEAT UNTIL syscall1(36) # -4; (*sync*)
+  END Sync;
+
+  (* --------- display --------- *)
+
   PROCEDURE SetBuffer*(base, width, height, scanline, bpp: INTEGER);
   BEGIN
+    Lock;
     active := FALSE;
     (*surface := SDLSetVideoMode(width, height, bpp, {anyformat});*)
     surface := SDLSetVideoMode(width, height, 0, {anyformat});
@@ -185,7 +280,8 @@ MODULE Host; (*linux/386 + SDL-1.2*)
       Abort
     END;
     SDLWMSetCaption("Oberon", "Oberon");
-    active := TRUE
+    active := TRUE;
+    Unlock
   END SetBuffer;
 
   PROCEDURE Repaint*(x, y, w, h: INTEGER);
@@ -193,35 +289,101 @@ MODULE Host; (*linux/386 + SDL-1.2*)
   BEGIN
     IF active & (surface # 0) & (w > 0) & (h > 0) & (dbuf # 0) THEN
       Y := Height - y - h;
+      Lock;
       REPEAT UNTIL SDLBlitSurface(dbuf, x, Y, w, h, surface, x, Y, Width, Height) = 0;
-      SDLUpdateRect(surface, x, Y, w, h)
+      SDLUpdateRect(surface, x, Y, w, h);
+      Unlock;
     END
   END Repaint;
 
-  PROCEDURE PollEvent*;
-    VAR ev: SDLEvent;
+  (* --------- input --------- *)
+
+  PROCEDURE HandleEvent(ev: SDLEvent);
   BEGIN
-    IF SDLPollEvent(ev) THEN
-      IF ev.type = 1 THEN (*SDL_ACTIVEEVENT*)
-        IF ev.pad1 = 4 THEN (*SDL_APPACTIVE*)
-          IF ev.pad0 # 0 THEN active := TRUE; Repaint(0, 0, Width, Height) END
-        END
-      ELSIF ev.type = 12 THEN (*SDL_QUIT*)
-        Exit
-      ELSIF ev.type = 17 THEN (*SDL_VIDEOEXPOSE*)
-        Repaint(0, 0, Width, Height)
+    IF ev.type = 1 THEN (*SDL_ACTIVEEVENT*)
+      IF ev.pad1 = 4 THEN (*SDL_APPACTIVE*)
+        IF ev.pad0 # 0 THEN active := TRUE; Repaint(0, 0, Width, Height) END
       END
+    ELSIF ev.type = 12 THEN (*SDL_QUIT*)
+      Exit
+    ELSIF ev.type = 17 THEN (*SDL_VIDEOEXPOSE*)
+      Repaint(0, 0, Width, Height)
     END
-  END PollEvent;
+  END HandleEvent;
+
+  PROCEDURE Available*(): INTEGER;
+    VAR ev: SDLKeyboardEvent; ok, Recd: BOOLEAN;
+  BEGIN
+    REPEAT
+      Lock; SDLPumpEvents; ok := SDLPeepEvent(SYSTEM.ADR(ev), peek, -{}); Unlock;
+      Recd := ok & (ev.type = SDLKeyDown) & (ev.keysym.sym < 300); (*ignore modifiers*)
+      IF ok & ~Recd & SDLPollEvent(SYSTEM.ADR(ev)) THEN HandleEvent(SYSTEM.VAL(SDLEvent, ev)) END
+    UNTIL ~ok OR Recd
+    RETURN ORD(Recd)
+  END Available;
+
+  PROCEDURE Read*(VAR ch: CHAR);
+    VAR ev: SDLKeyboardEvent; kbdCode: INTEGER; Shift, Ctrl: BOOLEAN;
+  BEGIN
+    REPEAT
+      Lock; REPEAT UNTIL SDLWaitEvent(SYSTEM.ADR(ev)); Unlock;
+      HandleEvent(SYSTEM.VAL(SDLEvent, ev));
+    UNTIL (ev.type = SDLKeyDown) & (ev.keysym.sym < 300); (*ignore modifiers*)
+
+    kbdCode := ev.keysym.sym;
+    Shift := (ev.keysym.mod * {0, 1}) # {}; (*shift*)
+    Ctrl := 6 IN ev.keysym.mod; (*ctrl*)
+    IF kbdCode < 128 THEN
+      kbdCode := ev.keysym.sym;
+      IF Shift OR Ctrl THEN INC(kbdCode, 80H) END; (*ctrl implies shift*)
+      SYSTEM.GET(KTabAdr + kbdCode, ch)
+    ELSIF kbdCode = 282 THEN (*f1*)
+      IF Shift OR Ctrl THEN ch := 0X ELSE ch := 1AX END
+    ELSIF kbdCode = 266 THEN (*keypad del*)
+      ch := 7FX (*del*)
+    ELSE ch := 0X
+    END;
+    IF Ctrl THEN ch := CHR(ORD(ch) MOD 20H) END
+  END Read;
+
+  PROCEDURE Mouse*(VAR keys: SET; VAR x, y: INTEGER);
+    VAR bits: SET; n: INTEGER;
+  BEGIN
+    keys := {}; n := Available();
+    Lock; bits := SDLGetMouseState(x, y); Unlock;
+    IF (*0*) 0 IN bits THEN INCL(keys, 2) END; (*left*)
+    IF (*1*) 2 IN bits THEN INCL(keys, 0) END; (*middle*)
+    IF (*2*) 1 IN bits THEN INCL(keys, 1) END; (*right*)
+    y := Height - y
+  END Mouse;
 
   PROCEDURE Init;
     VAR res: INTEGER; ok, done: BOOLEAN;
   BEGIN
     maxw := 1024; maxh := 768; active := FALSE;
+    KTabAdr := SYSTEM.ADR($
+      00 00 00 00 00 00 00 00  08 09 00 00 00 0D 00 00
+      00 00 00 00 00 00 00 00  00 00 00 1B 00 00 00 00
+      20 00 00 00 00 00 00 27  00 00 00 00 2C 2D 2E 2F
+      30 31 32 33 34 35 36 37  38 39 00 3B 00 3D 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 5B 5C 5D 00 00
+      60 61 62 63 64 65 66 67  68 69 6A 6B 6C 6D 6E 6F
+      70 71 72 73 74 75 76 77  78 79 7A 00 00 00 00 00
+      00 00 00 00 00 00 00 00  08 09 00 00 00 0D 00 00
+      00 00 00 00 00 00 00 00  00 00 00 1B 00 00 00 00
+      20 00 00 00 00 00 00 22  00 00 00 00 3C 5F 3E 3F
+      29 21 40 23 24 25 5E 26  2A 28 00 3A 00 2B 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 7B 7C 7D 00 00
+      7E 41 42 43 44 45 46 47  48 49 4A 4B 4C 4D 4E 4F
+      50 51 52 53 54 55 56 57  58 59 5A 00 00 00 00 00$);
     SYSTEM.PUT(SYSTEM.ADR(syscall1), SYSTEM.ADR($8B442404 CD80 C20400 6690 90$));
     SYSTEM.PUT(SYSTEM.ADR(syscall2), SYSTEM.ADR($8B442408 8B5C2404 CD80 C20800 6690 90$));
     SYSTEM.PUT(SYSTEM.ADR(syscall3), SYSTEM.ADR($8B44240C 8B5C2408 8B4C2404 CD80 C20C00 6690 90$));
     SYSTEM.PUT(SYSTEM.ADR(syscall4), SYSTEM.ADR($8B442410 8B5C240C 8B4C2408 8B542404 CD80 C21000 6690 90$));
+    InstallSignals;
+    Lock;
     IF SDL = 0 THEN
       Libraries.Load(library, SDL);
       IF SDL # 0 THEN
@@ -237,15 +399,24 @@ MODULE Host; (*linux/386 + SDL-1.2*)
         SYSTEM.PUT(SYSTEM.ADR(sdlUnlockSurface), Libraries.ThisProc(SDL, "SDL_UnlockSurface"));
         SYSTEM.PUT(SYSTEM.ADR(SDLGetError), Libraries.ThisProc(SDL, "SDL_GetError"));
         SYSTEM.PUT(SYSTEM.ADR(sdlWMSetCaption), Libraries.ThisProc(SDL, "SDL_WM_SetCaption"));
+        SYSTEM.PUT(SYSTEM.ADR(SDLPumpEvents), Libraries.ThisProc(SDL, "SDL_PumpEvents"));
+        SYSTEM.PUT(SYSTEM.ADR(sdlGetMouseState), Libraries.ThisProc(SDL, "SDL_GetMouseState"));
+        SYSTEM.PUT(SYSTEM.ADR(sdlShowCursor), Libraries.ThisProc(SDL, "SDL_ShowCursor"));
+        SYSTEM.PUT(SYSTEM.ADR(sdlPeepEvents), Libraries.ThisProc(SDL, "SDL_PeepEvents"));
+        SYSTEM.PUT(SYSTEM.ADR(sdlWaitEvent), Libraries.ThisProc(SDL, "SDL_WaitEvent"));
+        SYSTEM.PUT(SYSTEM.ADR(sdlEnableKeyRepeat), Libraries.ThisProc(SDL, "SDL_EnableKeyRepeat"));
         IF SDLInit({video, noparachute}) = -1 THEN
           WriteString(stderr, "Error: SDL_Init: "); WriteStringAdr(stderr, SDLGetError()); WriteLn(stderr);
           Abort
-        END
+        END;
+        SDLEnableKeyRepeat(500, 30);
+        SDLShowCursor(0)
       ELSE
         WriteString(stderr, "Error: failed to load "); WriteString(stderr, library); WriteLn(stderr);
         Abort
       END
-    END
+    END;
+    Unlock
   END Init;
 
 BEGIN Init
