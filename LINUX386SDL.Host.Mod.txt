@@ -4,6 +4,7 @@ MODULE Host; (*linux/386 + SDL-1.2*)
   CONST
     library = "libSDL.so";
     stderr = 2;
+    kbdsize = 16;
 
     (*SDLInit*)
     timer = 1; video = 5; noparachute = 20;
@@ -12,7 +13,7 @@ MODULE Host; (*linux/386 + SDL-1.2*)
     resizable = 4; anyformat = 28;
 
     (*SDLEvent.type*)
-    SDLKeyDown = 2; SDLKeyUp = 3;
+    SDLKeyDown = 2; SDLKeyUp = 3; SDLUserEvent = 24;
 
     (*SDLPeepEvent*)
     peek = 1;
@@ -20,7 +21,7 @@ MODULE Host; (*linux/386 + SDL-1.2*)
   TYPE
     SDLEvent = RECORD
       type, pad0, pad1, pad2: BYTE;
-      any: ARRAY 20 OF BYTE;
+      any: ARRAY 5 OF INTEGER;
     END;
 
     SDLKeyboardEvent = RECORD
@@ -35,14 +36,13 @@ MODULE Host; (*linux/386 + SDL-1.2*)
     END;
 
   VAR
-    maxw*, maxh*: INTEGER;
-    surface, dbuf: INTEGER;
-    active: BOOLEAN;
-    Base, Width, Height, Pitch: INTEGER;
     KTabAdr: INTEGER;  (*keyboard code translation table*)
-
-    AbortCommand: PROCEDURE;
-    esp, ebp: INTEGER;
+    thread, mutex: INTEGER;
+    MK: SET;
+    MX, MY: INTEGER;
+    KBuf: ARRAY kbdsize OF CHAR;
+    KI, KJ: INTEGER;
+    quit, repaint: BOOLEAN;
 
     syscall1: PROCEDURE (eax: INTEGER): INTEGER;
     syscall2: PROCEDURE (eax, ebx: INTEGER): INTEGER;
@@ -67,9 +67,38 @@ MODULE Host; (*linux/386 + SDL-1.2*)
     sdlWaitEvent: PROCEDURE (event: INTEGER): INTEGER;
     sdlShowCursor: PROCEDURE (*ccall*) (toggle: INTEGER);
     sdlEnableKeyRepeat: PROCEDURE (*ccall*) (interval, delay: INTEGER);
+    sdlCreateThread: PROCEDURE (*ccall*) (data: INTEGER; fn: PROCEDURE): INTEGER;
+    sdlWaitThread: PROCEDURE (*ccall*) (VAR status: INTEGER; thread: INTEGER);
+    SDLCreateMutex: PROCEDURE (*ccall*) (): INTEGER;
+    sdlLockMutex: PROCEDURE (*ccall*) (mutex: INTEGER): INTEGER;
+    sdlUnlockMutex: PROCEDURE (*ccall*) (mutex: INTEGER): INTEGER;
+    sdlDestroyMutex: PROCEDURE (*ccall*) (mutex: INTEGER);
+    sdlPushEvent: PROCEDURE (*ccall*) (ev: INTEGER): INTEGER;
+    sdlDelay: PROCEDURE (*ccall*) (ms: INTEGER);
+    sdlFlip: PROCEDURE (*ccall*) (screen: INTEGER);
     SDLGetError: PROCEDURE (*ccall*) (): INTEGER;
 
   (* --------- sdl --------- *)
+
+  PROCEDURE SDLCreateThread(fn: PROCEDURE; data: INTEGER): INTEGER;
+  BEGIN RETURN sdlCreateThread(data, fn)
+  END SDLCreateThread;
+
+  PROCEDURE SDLWaitThread(thread: INTEGER; VAR status: INTEGER);
+  BEGIN sdlWaitThread(status, thread)
+  END SDLWaitThread;
+
+  PROCEDURE SDLLockMutex(mutex: INTEGER): BOOLEAN;
+  BEGIN RETURN sdlLockMutex(mutex) = 0
+  END SDLLockMutex;
+
+  PROCEDURE SDLUnlockMutex(mutex: INTEGER): BOOLEAN;
+  BEGIN RETURN sdlUnlockMutex(mutex) = 0
+  END SDLUnlockMutex;
+
+  PROCEDURE SDLDestroyMutex(mutex: INTEGER);
+  BEGIN sdlDestroyMutex(mutex)
+  END SDLDestroyMutex;
 
   PROCEDURE SDLInit (flags: SET): INTEGER;
   BEGIN RETURN sdlInit(flags)
@@ -94,6 +123,10 @@ MODULE Host; (*linux/386 + SDL-1.2*)
   PROCEDURE SDLUpdateRect(surface, x, y, w, h: INTEGER);
   BEGIN sdlUpdateRect(h, w, y, x, surface)
   END SDLUpdateRect;
+
+  PROCEDURE SDLFlip(screen: INTEGER);
+  BEGIN sdlFlip(screen)
+  END SDLFlip;
 
   PROCEDURE SDLCreateRGBSurfaceFrom (pixels, width, height, depth, pitch, Rmask, Gmask, Bmask, Amask: INTEGER): INTEGER;
   BEGIN RETURN sdlCreateRGBSurfaceFrom(Amask, Bmask, Gmask, Rmask, pitch, depth, height, width, pixels)
@@ -136,6 +169,14 @@ MODULE Host; (*linux/386 + SDL-1.2*)
   PROCEDURE SDLWaitEvent (event: INTEGER): BOOLEAN;
   BEGIN RETURN sdlWaitEvent(event) # 0
   END SDLWaitEvent;
+
+  PROCEDURE SDLPushEvent (event: INTEGER): BOOLEAN;
+  BEGIN RETURN sdlPushEvent(event) = 0
+  END SDLPushEvent;
+
+  PROCEDURE SDLDelay(ms: INTEGER);
+  BEGIN sdlDelay(ms)
+  END SDLDelay;
 
   (* ------ utility --------- *)
 
@@ -196,14 +237,34 @@ MODULE Host; (*linux/386 + SDL-1.2*)
 
   (* --------- signals --------- *)
 
-  PROCEDURE Abort*;
+  PROCEDURE Lock;
+    VAR m: INTEGER;
   BEGIN
-    REPEAT UNTIL syscall3(37, syscall1(20), 6) # -4; (*kill(getpid(), SIGABRT)*)
-    REPEAT UNTIL syscall2(1, 1) # -4; (*exit*)
+    REPEAT m := syscall1(68) UNTIL m # -4; (*siggetmask()*)
+    REPEAT UNTIL syscall2(69, ORD(SYSTEM.VAL(SET, m) - {2})) # -4; (*sigsetmask(m-2)*)
+  END Lock;
+
+  PROCEDURE Unlock;
+    VAR m: INTEGER;
+  BEGIN
+    REPEAT m := syscall1(68) UNTIL m # -4; (*siggetmask()*)
+    REPEAT UNTIL syscall2(69, ORD(SYSTEM.VAL(SET, m) + {2})) # -4; (*sigsetmask(m+2)*)
+  END Unlock;
+
+  PROCEDURE Abort*;
+    VAR res, pid: INTEGER;
+  BEGIN
+    Lock;
+    quit := TRUE;
+    IF thread # 0 THEN SDLWaitThread(thread, res) END;
+    REPEAT pid := syscall1(20) UNTIL pid # -4; (*getpid()*)
+    REPEAT UNTIL syscall3(37, pid, 6) # -4; (*kill(getpid(), SIGABRT)*)
+    REPEAT UNTIL syscall2(1, 1) # -4; (*exit(1)*)
     REPEAT UNTIL FALSE
   END Abort;
 
   PROCEDURE Signal; (*void Signal(int sig, struct sigcontext ctx);*)
+    VAR AbortCommand: PROCEDURE;
   BEGIN
     SYSTEM.GET(Modules.MTOrg - 32, AbortCommand);
     IF AbortCommand # NIL THEN
@@ -226,26 +287,14 @@ MODULE Host; (*linux/386 + SDL-1.2*)
     REPEAT UNTIL syscall4(67, 2, SYSTEM.ADR(sa), 0) # -4; (*sigaction(SIGINT, &sa, NULL)*)
   END InstallSignals;
 
-  PROCEDURE Lock; (*disable aborts before enter sdl*)
-    VAR m: INTEGER;
-  BEGIN
-    REPEAT m := syscall1(68) UNTIL m # -4; (*siggetmask()*)
-    REPEAT UNTIL syscall2(69, ORD(SYSTEM.VAL(SET, m) - {2})) # -4; (*sigsetmask(m-2)*)
-  END Lock;
-
-  PROCEDURE Unlock;
-    VAR m: INTEGER;
-  BEGIN
-    REPEAT m := syscall1(68) UNTIL m # -4; (*siggetmask()*)
-    REPEAT UNTIL syscall2(69, ORD(SYSTEM.VAL(SET, m) + {2})) # -4; (*sigsetmask(m+2)*)
-  END Unlock;
-
   (* --------- commands --------- *)
 
   PROCEDURE Quit*(code: INTEGER);
     VAR res: INTEGER; ok: BOOLEAN;
   BEGIN
     Lock;
+    quit := TRUE;
+    IF thread # 0 THEN SDLWaitThread(thread, res) END;
     REPEAT UNTIL syscall1(36) # -4; (*sync*)
     IF SDL # 0 THEN SDLQuit; Libraries.Free(SDL); SDL := 0 END;
     REPEAT UNTIL syscall2(1, code) # -4; (*exit(code)*)
@@ -262,105 +311,183 @@ MODULE Host; (*linux/386 + SDL-1.2*)
 
   (* --------- display --------- *)
 
+  PROCEDURE GetBuffer*(VAR base, width, height, pitch, depth: INTEGER; askDepth: INTEGER);
+    VAR arg: ARRAY 6 OF INTEGER;
+  BEGIN base := -1;
+    IF (askDepth > 0) & (askDepth <= 32) & ((askDepth = 32) OR (askDepth IN {1, 8, 16, 24})) THEN
+      base := 0; width := 1024; height := 768; depth := askDepth; pitch := ((depth + 7) DIV 8) * width;
+
+      (* base = mmap(0, pitch * height, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); *)
+      arg[0] := 0; arg[1] := pitch * height; arg[2] := 3; arg[3] := 2H + 20H; arg[4] := -1; arg[5] := 0;
+      REPEAT base := syscall2(90, SYSTEM.ADR(arg)) UNTIL base # -4;
+      IF (base >= -4096) & (base < 0) THEN base := -1 END;
+    END;
+
+    IF base = -1 THEN
+      base := 0; width := 0; height := 0; pitch := 0; depth := 0;
+    END;
+  END GetBuffer;
+
   PROCEDURE SetBuffer*(base, width, height, scanline, bpp: INTEGER);
+    VAR ev: SDLEvent;
   BEGIN
-    Lock;
-    active := FALSE;
-    (*surface := SDLSetVideoMode(width, height, bpp, {anyformat});*)
-    surface := SDLSetVideoMode(width, height, 0, {anyformat});
-    Base := base; Width := width; Height := height; Pitch := scanline;
-    IF surface = 0 THEN
-      WriteString(stderr, "Error: SDL_SetVideoMode: "); WriteStringAdr(stderr, SDLGetError()); WriteLn(stderr);
-      Abort
-    END;
-    IF dbuf # 0 THEN SDLFreeSurface(dbuf) END;
-    dbuf := SDLCreateRGBSurfaceFrom(Base, Width, Height, bpp, Pitch, 0, 0, 0, 0);
-    IF dbuf = 0 THEN
-      WriteString(stderr, "Error: SDL_CreateRGBSurfaceFrom: "); WriteStringAdr(stderr, SDLGetError()); WriteLn(stderr);
-      Abort
-    END;
-    SDLWMSetCaption("Oberon", "Oberon");
-    active := TRUE;
-    Unlock
+    ev.type := SDLUserEvent;
+    ev.pad0 := bpp;
+    ev.any[0] := base;
+    ev.any[1] := width;
+    ev.any[2] := height;
+    ev.any[3] := scanline;
+    ev.any[4] := 0;
+    Lock; REPEAT UNTIL SDLPushEvent(SYSTEM.ADR(ev)); Unlock;
   END SetBuffer;
 
   PROCEDURE Repaint*(x, y, w, h: INTEGER);
-    VAR Y: INTEGER;
-  BEGIN
-    IF active & (surface # 0) & (w > 0) & (h > 0) & (dbuf # 0) THEN
-      Y := Height - y - h;
-      Lock;
-      REPEAT UNTIL SDLBlitSurface(dbuf, x, Y, w, h, surface, x, Y, Width, Height) = 0;
-      SDLUpdateRect(surface, x, Y, w, h);
-      Unlock;
-    END
+  BEGIN repaint := TRUE;
   END Repaint;
 
   (* --------- input --------- *)
 
-  PROCEDURE HandleEvent(ev: SDLEvent);
-  BEGIN
-    IF ev.type = 1 THEN (*SDL_ACTIVEEVENT*)
-      IF ev.pad1 = 4 THEN (*SDL_APPACTIVE*)
-        IF ev.pad0 # 0 THEN active := TRUE; Repaint(0, 0, Width, Height) END
-      END
-    ELSIF ev.type = 12 THEN (*SDL_QUIT*)
-      Exit
-    ELSIF ev.type = 17 THEN (*SDL_VIDEOEXPOSE*)
-      Repaint(0, 0, Width, Height)
-    END
-  END HandleEvent;
-
   PROCEDURE Available*(): INTEGER;
-    VAR ev: SDLKeyboardEvent; ok, Recd: BOOLEAN;
+    VAR Recd: BOOLEAN;
   BEGIN
-    REPEAT
-      Lock; SDLPumpEvents; ok := SDLPeepEvent(SYSTEM.ADR(ev), peek, -{}); Unlock;
-      Recd := ok & (ev.type = SDLKeyDown) & (ev.keysym.sym < 300); (*ignore modifiers*)
-      IF ok & ~Recd & SDLPollEvent(SYSTEM.ADR(ev)) THEN HandleEvent(SYSTEM.VAL(SDLEvent, ev)) END
-    UNTIL ~ok OR Recd
+    IF quit THEN Exit END;
+    Lock;
+    REPEAT UNTIL SDLLockMutex(mutex);
+    Recd := KI # KJ;
+    REPEAT UNTIL SDLUnlockMutex(mutex);
+    Unlock;
     RETURN ORD(Recd)
   END Available;
 
   PROCEDURE Read*(VAR ch: CHAR);
-    VAR ev: SDLKeyboardEvent; kbdCode: INTEGER; Shift, Ctrl: BOOLEAN;
   BEGIN
-    REPEAT
-      Lock; REPEAT UNTIL SDLWaitEvent(SYSTEM.ADR(ev)); Unlock;
-      HandleEvent(SYSTEM.VAL(SDLEvent, ev));
-    UNTIL (ev.type = SDLKeyDown) & (ev.keysym.sym < 300); (*ignore modifiers*)
-
-    kbdCode := ev.keysym.sym;
-    Shift := (ev.keysym.mod * {0, 1}) # {}; (*shift*)
-    Ctrl := 6 IN ev.keysym.mod; (*ctrl*)
-    IF kbdCode < 128 THEN
-      kbdCode := ev.keysym.sym;
-      IF Shift OR Ctrl THEN INC(kbdCode, 80H) END; (*ctrl implies shift*)
-      SYSTEM.GET(KTabAdr + kbdCode, ch)
-    ELSIF kbdCode = 282 THEN (*f1*)
-      IF Shift OR Ctrl THEN ch := 0X ELSE ch := 1AX END
-    ELSIF kbdCode = 266 THEN (*keypad del*)
-      ch := 7FX (*del*)
-    ELSE ch := 0X
+    IF quit THEN Exit END;
+    Lock; REPEAT UNTIL SDLLockMutex(mutex);
+    WHILE KI = KJ DO (*wait input*)
+      REPEAT UNTIL SDLUnlockMutex(mutex); Unlock; (*unlock signal in case of sigint*)
+      Lock; SDLDelay(10); Unlock;
+      Lock; REPEAT UNTIL SDLLockMutex(mutex);
     END;
-    IF Ctrl THEN ch := CHR(ORD(ch) MOD 20H) END
+    ch := KBuf[KI]; KI := (KI + 1) MOD kbdsize;
+    REPEAT UNTIL SDLUnlockMutex(mutex); Unlock;
   END Read;
 
   PROCEDURE Mouse*(VAR keys: SET; VAR x, y: INTEGER);
     VAR bits: SET; n: INTEGER;
   BEGIN
-    keys := {}; n := Available();
-    Lock; bits := SDLGetMouseState(x, y); Unlock;
-    IF (*0*) 0 IN bits THEN INCL(keys, 2) END; (*left*)
-    IF (*1*) 2 IN bits THEN INCL(keys, 0) END; (*middle*)
-    IF (*2*) 1 IN bits THEN INCL(keys, 1) END; (*right*)
-    y := Height - y
+    IF quit THEN Exit END;
+    Lock;
+    REPEAT UNTIL SDLLockMutex(mutex);
+    keys := MK; x := MX; y := MY;
+    REPEAT UNTIL SDLUnlockMutex(mutex);
+    Unlock;
   END Mouse;
+
+  PROCEDURE Loop;
+    VAR
+      pid: INTEGER;
+      ev: SDLEvent; window, fb, temp, Width, Height: INTEGER;
+      kev: SDLKeyboardEvent; kbdCode: INTEGER; Shift, Ctrl: BOOLEAN; ch: CHAR;
+      bits, keys: SET; x, y: INTEGER; scanMouse: BOOLEAN;
+      active: BOOLEAN;
+      (*SHARED GLOBAL VARIABLES: thread, mutex, quit, repaint, MK, MX, MY, KI, KJ, KBuf*)
+  BEGIN
+    REPEAT pid := syscall1(20) UNTIL pid # -4; (*pid := getpid()*)
+    REPEAT UNTIL syscall4(172, 15, SYSTEM.ADR("SDL Oberon loop"), 0) # -4; (*prctl(RP_SET_NAME, "SDL Oberon loop", 0, ?, ?)*)
+    window := 0; fb := 0; repaint := FALSE; active := FALSE;
+    SDLEnableKeyRepeat(500, 30);
+    SDLShowCursor(0);
+
+    REPEAT
+      IF SDLPollEvent(SYSTEM.ADR(ev)) THEN
+        IF ev.type = 1 THEN (*SDL_ACTIVEEVENT*)
+          IF ev.pad1 = 4 THEN (*SDL_APPACTIVE*)
+            active := ev.pad0 # 0;
+            IF active THEN
+              repaint := TRUE;
+            END;
+          END;
+        ELSIF ev.type = 2 THEN (*SDL_KEYDOWN*)
+          kev := SYSTEM.VAL(SDLKeyboardEvent, ev);
+          kbdCode := kev.keysym.sym;
+          Shift := (kev.keysym.mod * {0, 1}) # {}; (*shift*)
+          Ctrl := 6 IN kev.keysym.mod; (*ctrl*)
+          IF kbdCode < 128 THEN
+            IF Shift OR Ctrl THEN INC(kbdCode, 80H) END; (*ctrl implies shift*)
+            SYSTEM.GET(KTabAdr + kbdCode, ch);
+          ELSIF kbdCode = 282 THEN (*f1*)
+            IF Shift OR Ctrl THEN ch := 0X ELSE ch := 1AX END;
+          ELSIF kbdCode = 266 THEN (*keypad del*)
+            ch := 7FX (*del*)
+          ELSE ch := 0X
+          END;
+          IF (7 IN kev.keysym.mod) & ((kbdCode = 318) OR (kbdCode = 19)) THEN (*lctrl+break/pause*)
+            REPEAT UNTIL syscall3(37, pid, 2) # -4; (*kill(pid, SIGINT)*)
+          ELSE (*push into keyboard buffer*)
+            IF Ctrl THEN ch := CHR(ORD(ch) MOD 20H) END;
+            REPEAT UNTIL SDLLockMutex(mutex);
+            temp := (KJ + 1) MOD kbdsize;
+            IF temp = KI THEN
+              WriteString(stderr, "Warning: keyboard buffer overrun"); WriteLn(stderr);
+              KI := (KI + 1) MOD kbdsize; (*drop last char*)
+            END;
+            KBuf[temp] := ch; KI := temp;
+            REPEAT UNTIL SDLUnlockMutex(mutex);
+          END;
+        ELSIF (ev.type IN {4, 5, 6}) THEN (*SDL_MOUSEMOTION, SDL_MOUSEBUTTONDOWN, SDL_MOUSEBUTTONUP*)
+          scanMouse := TRUE;
+        ELSIF ev.type = 12 THEN (*SDL_QUIT*)
+          quit := TRUE;
+        ELSIF ev.type = 17 THEN (*SDL_VIDEOEXPOSE*)
+          repaint := TRUE;
+        ELSIF ev.type = SDLUserEvent+0 THEN (*SetBuffer*)
+          temp := SDLSetVideoMode(ev.any[1], ev.any[2], ev.pad0, {anyformat});
+          IF temp # 0 THEN
+            SDLWMSetCaption("Oberon", "Oberon");
+            window := temp;
+          ELSE WriteString(stderr, "Error: SDL_SetVideoMode: "); WriteStringAdr(stderr, SDLGetError()); WriteLn(stderr);
+          END;
+          temp := SDLCreateRGBSurfaceFrom(ev.any[0], ev.any[1], ev.any[2], ev.pad0, ev.any[3], 0, 0, 0, 0);
+          IF temp # 0 THEN
+            IF fb # 0 THEN SDLFreeSurface(fb) END;
+            fb := temp;
+          ELSE WriteString(stderr, "Error: SDL_CreateRGBSurface: "); WriteStringAdr(stderr, SDLGetError()); WriteLn(stderr);
+          END;
+          active := (window # 0) & (fb # 0); repaint := TRUE;
+          IF fb # 0 THEN
+            SYSTEM.GET(fb + 8, Width);
+            SYSTEM.GET(fb + 12, Height);
+          END;
+        END;
+      END;
+
+      IF scanMouse THEN
+        keys := {}; bits := SDLGetMouseState(x, y);
+        IF (*0*) 0 IN bits THEN INCL(keys, 2) END; (*left*)
+        IF (*1*) 2 IN bits THEN INCL(keys, 0) END; (*middle*)
+        IF (*2*) 1 IN bits THEN INCL(keys, 1) END; (*right*)
+        REPEAT UNTIL SDLLockMutex(mutex);
+        MK := keys; MX := x; MY := Height - y;
+        REPEAT UNTIL SDLUnlockMutex(mutex);
+        scanMouse := FALSE;
+      END;
+
+      (*redraw screen*)
+      IF active THEN
+        IF repaint & (window # 0) & (fb # 0) THEN
+          repaint := FALSE; (*possible race condition here, but it hint anyway*)
+          REPEAT UNTIL SDLBlitSurface(fb, 0, 0, Width, Height, window, 0, 0, Width, Height) = 0;
+          SDLFlip(window);
+        END;
+        SDLDelay(1);
+      ELSE SDLDelay(10);
+      END
+    UNTIL quit;
+  END Loop;
 
   PROCEDURE Init;
     VAR res: INTEGER; ok, done: BOOLEAN;
   BEGIN
-    maxw := 1024; maxh := 768; active := FALSE;
     KTabAdr := SYSTEM.ADR($
       00 00 00 00 00 00 00 00  08 09 00 00 00 0D 00 00
       00 00 00 00 00 00 00 00  00 00 00 1B 00 00 00 00
@@ -405,12 +532,29 @@ MODULE Host; (*linux/386 + SDL-1.2*)
         SYSTEM.PUT(SYSTEM.ADR(sdlPeepEvents), Libraries.ThisProc(SDL, "SDL_PeepEvents"));
         SYSTEM.PUT(SYSTEM.ADR(sdlWaitEvent), Libraries.ThisProc(SDL, "SDL_WaitEvent"));
         SYSTEM.PUT(SYSTEM.ADR(sdlEnableKeyRepeat), Libraries.ThisProc(SDL, "SDL_EnableKeyRepeat"));
+        SYSTEM.PUT(SYSTEM.ADR(sdlCreateThread), Libraries.ThisProc(SDL, "SDL_CreateThread"));
+        SYSTEM.PUT(SYSTEM.ADR(sdlWaitThread), Libraries.ThisProc(SDL, "SDL_WaitThread"));
+        SYSTEM.PUT(SYSTEM.ADR(SDLCreateMutex), Libraries.ThisProc(SDL, "SDL_CreateMutex"));
+        SYSTEM.PUT(SYSTEM.ADR(sdlLockMutex), Libraries.ThisProc(SDL, "SDL_mutexP")); (*SDL_LockMutex*)
+        SYSTEM.PUT(SYSTEM.ADR(sdlUnlockMutex), Libraries.ThisProc(SDL, "SDL_mutexV")); (*SDL_LockMutex*)
+        SYSTEM.PUT(SYSTEM.ADR(sdlDestroyMutex), Libraries.ThisProc(SDL, "SDL_DestroyMutex"));
+        SYSTEM.PUT(SYSTEM.ADR(sdlPushEvent), Libraries.ThisProc(SDL, "SDL_PushEvent"));
+        SYSTEM.PUT(SYSTEM.ADR(sdlDelay), Libraries.ThisProc(SDL, "SDL_Delay"));
+        SYSTEM.PUT(SYSTEM.ADR(sdlFlip), Libraries.ThisProc(SDL, "SDL_Flip"));
         IF SDLInit({video, noparachute}) = -1 THEN
           WriteString(stderr, "Error: SDL_Init: "); WriteStringAdr(stderr, SDLGetError()); WriteLn(stderr);
           Abort
         END;
-        SDLEnableKeyRepeat(500, 30);
-        SDLShowCursor(0)
+        mutex := SDLCreateMutex();
+        IF mutex = 0 THEN
+          WriteString(stderr, "Error: SDL_CreateMutex: "); WriteStringAdr(stderr, SDLGetError()); WriteLn(stderr);
+          Abort
+        END;
+        thread := SDLCreateThread(Loop, 0);
+        IF thread = 0 THEN
+          WriteString(stderr, "Error: SDL_CreateThread: "); WriteStringAdr(stderr, SDLGetError()); WriteLn(stderr);
+          Abort
+        END;
       ELSE
         WriteString(stderr, "Error: failed to load "); WriteString(stderr, library); WriteLn(stderr);
         Abort

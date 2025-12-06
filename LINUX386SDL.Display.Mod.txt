@@ -141,21 +141,17 @@ MODULE Display;  (*NW 5.11.2013 / 17.1.2019*)
   END ReplPattern;
 
   PROCEDURE Init;
-    CONST bpp = 32;
-    VAR buf: ARRAY 6 OF INTEGER; syscall2: PROCEDURE (eax, ebx: INTEGER): INTEGER;
+    VAR depth: INTEGER;
   BEGIN
-    Base := 0; Width := Host.maxw; Height := Host.maxh; stride := Width * (bpp DIV 8);
-
-    (* Base = mmap(0, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0); *)
-    SYSTEM.PUT(SYSTEM.ADR(syscall2), SYSTEM.ADR($8B442408 8B5C2404 CD80 C20800 6690 90$));
-    buf[0] := 0; buf[1] := stride * Height; buf[2] := 3; buf[3] := 2H + 20H; buf[4] := -1; buf[5] := 0;
-    REPEAT Base := syscall2(90, SYSTEM.ADR(buf)) UNTIL Base # -4;
-    IF (Base >= -4096) & (Base < 0) THEN
-      Host.WriteString(2, "Error: failed to mmap framebuffer"); Host.WriteLn(2);
+    Host.GetBuffer(Base, Width, Height, stride, depth, 32);
+    IF Base = 0 THEN
+      Host.WriteString(2, "Error: Display.Init: failed to get framebuffer"); Host.WriteLn(2);
+      Host.Abort
+    ELSIF depth # 32 THEN
+      Host.WriteString(2, "Error: Display.Init: unsupported framebuffer depth"); Host.WriteLn(2);
       Host.Abort
     END;
-
-    Host.SetBuffer(Base, Width, Height, stride, bpp);
+    Host.SetBuffer(Base, Width, Height, stride, depth);
   END Init;
 
 BEGIN Init;
