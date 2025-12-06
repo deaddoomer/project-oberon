@@ -289,6 +289,10 @@ MODULE Host; (*linux/386 + SDL-1.2*)
 
   (* --------- commands --------- *)
 
+  PROCEDURE Sleep*(ms: INTEGER);
+  BEGIN SDLDelay(ms)
+  END Sleep;
+
   PROCEDURE Quit*(code: INTEGER);
     VAR res: INTEGER; ok: BOOLEAN;
   BEGIN
