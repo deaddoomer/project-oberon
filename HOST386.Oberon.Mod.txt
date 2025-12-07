@@ -399,10 +399,6 @@ MODULE Oberon; (*JG 6.9.90 / 23.9.93 / 13.8.94 / NW 14.4.2013 / 22.12.2015*)
     SYSTEM.LDREG(4, Kernel.stackOrg); (*reset stack pointer*) Loop
   END Reset;
 
-  PROCEDURE Idle;
-  BEGIN Host.Sleep(1)
-  END Idle;
-
 BEGIN User[0] := 0X;
   Arrow.Fade := FlipArrow; Arrow.Draw := FlipArrow;
   Star.Fade := FlipStar; Star.Draw := FlipStar;
@@ -416,6 +412,6 @@ BEGIN User[0] := 0X;
   FocusViewer := Viewers.This(0, 0);
   CurFnt := Fonts.Default; CurCol := Display.white; CurOff := 0;
 
-  ActCnt := 0; CurTask := NewTask(GC, 1000); Install(CurTask); Install(NewTask(Idle, 0));
+  ActCnt := 0; CurTask := NewTask(GC, 1000); Install(CurTask); Install(NewTask(Host.Idle, 0));
   Modules.Load("System", Mod); Mod := NIL; Loop
 END Oberon.
