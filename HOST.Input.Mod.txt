@@ -16,7 +16,7 @@ MODULE Input; (*NW 5.10.86 / 15.11.90 Ceres-2; PDR 21.4.12 / NW 15.5.2013 Ceres-
   BEGIN
     Host.Mouse(keys, x, y);
     IF x < 0 THEN x := 0 ELSIF x >= MW THEN x := MW - 1 END;
-    IF y < 0 THEN x := 0 ELSIF y >= MH THEN y := MH - 1 END
+    IF y < 0 THEN y := 0 ELSIF y >= MH THEN y := MH - 1 END
   END Mouse;
 
   PROCEDURE SetMouseLimits*(w, h: INTEGER);
