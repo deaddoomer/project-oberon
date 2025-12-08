@@ -264,7 +264,20 @@ MODULE Host;  (*linux/386*)
   END PeekMouse;
 
   PROCEDURE Mouse*(VAR keys: SET; VAR x, y: INTEGER);
-  BEGIN PeekMouse(); keys := MK; x := MX; y := MY
+    CONST modifier = 56; (*lalt*)
+    VAR i, j: INTEGER; state: ARRAY 2 OF SET; Alt: BOOLEAN;
+  BEGIN PeekMouse(); keys := MK; x := MX; y := MY;
+    IF 2 IN MK THEN (*left*)
+      Alt := FALSE; j := 0;
+      FOR i := 0 TO LEN(state) - 1 DO state[i] := {} END;
+      WHILE ~Alt & (j < KN) DO
+        (*ioctl(fd, EVIOCGKEY(sizeof(state)), state)*)
+        REPEAT i := syscall4(54, kbd[j], 80004518H + LEN(state)*4 * 65536, SYSTEM.ADR(state)) UNTIL i # -4;
+        Alt := (modifier MOD 32) IN state[modifier DIV 32];
+        INC(j);
+      END;
+      IF Alt THEN keys := MK - {2} + {1} END;
+    END;
   END Mouse;
 
   PROCEDURE Decimal (VAR s: ARRAY OF CHAR; j, x: INTEGER);
