@@ -90,29 +90,6 @@ MODULE Host;  (*linux/386*)
 
   (* --------- signals --------- *)
 
-  PROCEDURE Cleanup;
-    VAR res: INTEGER;
-  BEGIN
-    quit := TRUE;
-    IF thread > 0 THEN
-      REPEAT res := syscall4(7, thread, 0, 0) UNTIL res # -4;
-    END;
-    IF tty >= 0 THEN
-      IF 2 IN init THEN
-        REPEAT UNTIL syscall4(54, tty, 4B45H, kbmode) # -4; (*ioctl(tty, KDSKBMODE, kbmode)*)
-      END;
-      IF 1 IN init THEN
-        REPEAT UNTIL syscall4(54, tty, 4B3AH, kdmode) # -4; (*ioctl(tty, KDSETMODE, kdmode)*)
-      END;
-      IF 0 IN init THEN
-        vtmodestr[0] := vtmode;
-        REPEAT UNTIL syscall4(54, tty, 5602H, SYSTEM.ADR(vtmodestr)) # -4; (*ioctl(tty, VT_SETMODE, vtmodestr)*)
-      END;
-      REPEAT UNTIL syscall2(6, tty) # -4; (*close(tty)*)
-      tty := -1;
-    END;
-  END Cleanup;
-
   PROCEDURE Lock;
     VAR m: INTEGER;
   BEGIN
@@ -131,7 +108,7 @@ MODULE Host;  (*linux/386*)
     VAR pid, res: INTEGER;
   BEGIN
     Lock;
-    Cleanup;
+    quit := TRUE;
     REPEAT pid := syscall1(20) UNTIL pid # -4; (*getpid()*)
     REPEAT UNTIL syscall3(37, -pid, 6) # -4; (*kill(getpid(), SIGABRT)*)
     REPEAT UNTIL syscall2(1, 1) # -4; (*exit(1)*)
@@ -162,7 +139,124 @@ MODULE Host;  (*linux/386*)
     REPEAT UNTIL syscall4(67, 2, SYSTEM.ADR(sa), 0) # -4; (*sigaction(SIGINT, &sa, NULL)*)
   END InstallSignals;
 
+  (* --------- tty --------- *)
+
+  PROCEDURE EnterTTY;
+    VAR res: INTEGER;
+  BEGIN
+    (*disable automatic TTY switch*)
+    vtmodestr[0] := 1; (* vtmodestr.mode = VT_PROCESS *)
+    REPEAT res := syscall4(54, tty, 5602H, SYSTEM.ADR(vtmodestr)) UNTIL res # -4; (*ioctl(tty, VT_SETMODE, &vtmodestr)*)
+    IF res # 0 THEN
+      WriteString(stderr, "Error: ioctl VT_SETMODE failed"); WriteLn(stderr);
+      Abort;
+    END;
+
+    (*disable keyboard echo to screen*)
+    REPEAT res := syscall4(54, tty, 4B3AH, 1) UNTIL res # -4; (*ioctl(tty, KDSETMODE, KD_GRAPHICS)*)
+    IF res # 0 THEN
+      WriteString(stderr, "Error: ioctl KDSETMODE failed"); WriteLn(stderr);
+      Abort;
+    END;
+
+    (*disable key processing by virtual console*)
+    REPEAT res := syscall4(54, tty, 4B45H, 4) UNTIL res # -4; (*ioctl(tty, KDSKBMODE, K_OFF)*)
+    IF res # 0 THEN
+      WriteString(stderr, "Error: ioctl KDSKBMODE failed"); WriteLn(stderr);
+      Abort;
+    END;
+  END EnterTTY;
+
+  PROCEDURE ExitTTY;
+  BEGIN
+    IF tty >= 0 THEN
+      IF 2 IN init THEN
+        REPEAT UNTIL syscall4(54, tty, 4B45H, kbmode) # -4; (*ioctl(tty, KDSKBMODE, kbmode)*)
+      END;
+      IF 1 IN init THEN
+        REPEAT UNTIL syscall4(54, tty, 4B3AH, kdmode) # -4; (*ioctl(tty, KDSETMODE, kdmode)*)
+      END;
+      IF 0 IN init THEN
+        vtmodestr[0] := vtmode;
+        REPEAT UNTIL syscall4(54, tty, 5602H, SYSTEM.ADR(vtmodestr)) # -4; (*ioctl(tty, VT_SETMODE, vtmodestr)*)
+      END;
+    END;
+  END ExitTTY;
+
+  PROCEDURE SwitchTTY(vt: INTEGER);
+    VAR state: ARRAY 2 OF INTEGER; res, myvt: INTEGER;
+  BEGIN
+    IF tty >= 0 THEN
+      REPEAT res := syscall4(54, tty, 5603H, SYSTEM.ADR(state)) UNTIL res # -4; (*ioctl(tty, VT_GETSTATE, &state)*)
+      IF res >= 0 THEN
+        myvt := state[0] MOD 65536;
+        IF myvt # vt THEN
+          ExitTTY;
+          REPEAT res := syscall4(54, tty, 5606H, vt) UNTIL res # -4; (*ioctl(tty, VT_ACTIVATE, vt)*)
+          IF res = 0 THEN
+            REPEAT res := syscall4(54, tty, 5607H, vt) UNTIL res # -4; (*ioctl(tty, VT_WAITACTIVE, vt)*)
+          END;
+          REPEAT res := syscall4(54, tty, 5607H, myvt) UNTIL res # -4; (*ioctl(tty, VT_WAITACTIVE, myvt)*)
+          EnterTTY;
+        END;
+      END;
+    END;
+  END SwitchTTY;
+
+  PROCEDURE OpenTTY;
+    VAR res: INTEGER;
+  BEGIN
+    (*open current TTY*)
+    REPEAT tty := syscall4(5, SYSTEM.ADR("/dev/tty"), 2, 0) UNTIL tty # -4; (*open("/dev/tty", O_RDWR)*)
+    IF tty < 0 THEN
+      WriteString(stderr, "Error: failed to open /dev/tty"); WriteLn(stderr);
+      Abort;
+    END;
+
+    (*save TTY state*)
+    REPEAT res := syscall4(54, tty, 5601H, SYSTEM.ADR(vtmodestr)) UNTIL res # -4; (*ioctl(tty, VT_GETMODE, &vtmodestr)*)
+    IF res # 0 THEN
+      WriteString(stderr, "Error: ioctl VT_GETMODE failed"); WriteLn(stderr);
+      Abort;
+    END;
+    vtmode := vtmodestr[0];
+    INCL(init, 0);
+
+    REPEAT res := syscall4(54, tty, 4B3BH, SYSTEM.ADR(kdmode)) UNTIL res # -4; (*ioctl(tty, KDGETMODE, &kdmode)*)
+    IF res # 0 THEN
+      WriteString(stderr, "Error: ioctl KDGETMODE failed"); WriteLn(stderr);
+      Abort;
+    END;
+    INCL(init, 1);
+
+    REPEAT res := syscall4(54, tty, 4B44H, SYSTEM.ADR(kbmode)) UNTIL res # -4; (*ioctl(tty, KDGKBMODE, &kbmode)*)
+    IF res # 0 THEN
+      WriteString(stderr, "Error: ioctl KDGKBMODE failed"); WriteLn(stderr);
+      Abort;
+    END;
+    INCL(init, 2);
+  END OpenTTY;
+
+  PROCEDURE CloseTTY;
+  BEGIN
+    IF tty >= 0 THEN
+      ExitTTY;
+      REPEAT UNTIL syscall2(6, tty) # -4; (*close(tty)*)
+      tty := -1;
+    END;
+  END CloseTTY;
+
   (* --------- commands --------- *)
+
+  PROCEDURE Cleanup;
+    VAR res: INTEGER;
+  BEGIN
+    quit := TRUE;
+    IF thread > 0 THEN
+      REPEAT res := syscall4(7, thread, 0, 0) UNTIL res # -4; (*waitpid*)
+    END;
+    CloseTTY;
+  END Cleanup;
 
   PROCEDURE Sleep*(ms: INTEGER);
     VAR tv: ARRAY 2 OF INTEGER;
@@ -413,8 +507,8 @@ MODULE Host;  (*linux/386*)
   END InitDisplay;
 
   PROCEDURE KeyboardWatcher;
-    VAR i, fd, res, count, type, code, value, pid: INTEGER; buf: ARRAY 4 OF INTEGER; Up, Ctrl: BOOLEAN;
-  BEGIN Ctrl := FALSE;
+    VAR i, fd, res, count, type, code, value, pid, vt: INTEGER; buf: ARRAY 4 OF INTEGER; Up, RCtrl, Ctrl, Alt: BOOLEAN;
+  BEGIN RCtrl := FALSE; Ctrl := FALSE; Alt := FALSE;
     REPEAT pid := syscall1(20) UNTIL pid # -4; (*getpid()*)
     REPEAT
       FOR i := 0 TO KN - 1 DO
@@ -432,14 +526,27 @@ MODULE Host;  (*linux/386*)
             IF type = 0 THEN (*EV_SYN*)
               IF code = 3 THEN (* SYN_DROPPED => fsync(fd) *)
                 REPEAT UNTIL syscall2(118, fd) # -4;
-                Ctrl := FALSE;
+                RCtrl := FALSE; Ctrl := FALSE; Alt := FALSE;
               END
             ELSIF type = 1 THEN (*EV_KEY*)
               Up := value = 0;
-              IF code = 97 THEN (*rctrl*) Ctrl := ~Up
-              ELSIF ~Up & ((code = 411) OR (code = 119)) THEN (*break/pause*)
-                REPEAT UNTIL syscall3(37, pid, 2) # -4; (*kill(getpid(), SIGINT)*)
-              END
+              IF code = 29 THEN Ctrl := ~Up
+              ELSIF code = 56 THEN Alt := ~Up
+              ELSIF code = 97 THEN RCtrl := ~Up
+              ELSIF ~Up THEN
+                IF RCtrl & ((code = 441) OR (code = 119)) THEN (*Ctrl+Break/Pause*)
+                  REPEAT UNTIL syscall3(37, pid, 2) # -4; (*kill(getpid(), SIGINT)*)
+                ELSIF Ctrl & Alt THEN (*Ctrl+Alt+Fx*)
+                  IF (code >= 59) & (code <= 68) THEN vt := code - 59 + 1; (*F1..F10*)
+                  ELSIF code = 87 THEN vt := 11; (*F11*)
+                  ELSIF code = 88 THEN vt := 12; (*F12*)
+                  ELSE vt := -1
+                  END;
+                  IF vt # -1 THEN
+                    SwitchTTY(vt);
+                  END
+                END;
+              END;
             END
           END
         UNTIL (res <= 0) OR (count = 0);
@@ -482,62 +589,11 @@ MODULE Host;  (*linux/386*)
     SYSTEM.PUT(SYSTEM.ADR(syscall4), SYSTEM.ADR($8B442410 8B5C240C 8B4C2408 8B542404 CD80 C21000 6690 90$));
     InstallSignals;
 
-    (*open current TTY*)
-    REPEAT tty := syscall4(5, SYSTEM.ADR("/dev/tty"), 2, 0) UNTIL tty # -4; (*open("/dev/tty", O_RDWR)*)
-    IF tty < 0 THEN
-      WriteString(stderr, "Error: failed to open /dev/tty"); WriteLn(stderr);
-      Abort;
-    END;
-
-    (*save TTY state*)
-    REPEAT res := syscall4(54, tty, 5601H, SYSTEM.ADR(vtmodestr)) UNTIL res # -4; (*ioctl(tty, VT_GETMODE, &vtmodestr)*)
-    IF res # 0 THEN
-      WriteString(stderr, "Error: ioctl VT_GETMODE failed"); WriteLn(stderr);
-      Abort;
-    END;
-    vtmode := vtmodestr[0];
-    INCL(init, 0);
-
-    REPEAT res := syscall4(54, tty, 4B3BH, SYSTEM.ADR(kdmode)) UNTIL res # -4; (*ioctl(tty, KDGETMODE, &kdmode)*)
-    IF res # 0 THEN
-      WriteString(stderr, "Error: ioctl KDGETMODE failed"); WriteLn(stderr);
-      Abort;
-    END;
-    INCL(init, 1);
-
-    REPEAT res := syscall4(54, tty, 4B44H, SYSTEM.ADR(kbmode)) UNTIL res # -4; (*ioctl(tty, KDGKBMODE, &kbmode)*)
-    IF res # 0 THEN
-      WriteString(stderr, "Error: ioctl KDGKBMODE failed"); WriteLn(stderr);
-      Abort;
-    END;
-    INCL(init, 2);
-
+    OpenTTY;
     InitInput;
     InitDisplay;
     MY := Height;
-
-    (*disable automatic TTY switch*)
-    vtmodestr[0] := 1; (* vtmodestr.mode = VT_PROCESS *)
-    REPEAT res := syscall4(54, tty, 5602H, SYSTEM.ADR(vtmodestr)) UNTIL res # -4; (*ioctl(tty, VT_SETMODE, &vtmodestr)*)
-    IF res # 0 THEN
-      WriteString(stderr, "Error: ioctl VT_SETMODE failed"); WriteLn(stderr);
-      Abort;
-    END;
-
-    (*disable keyboard echo to screen*)
-    REPEAT res := syscall4(54, tty, 4B3AH, 1) UNTIL res # -4; (*ioctl(tty, KDSETMODE, KD_GRAPHICS)*)
-    IF res # 0 THEN
-      WriteString(stderr, "Error: ioctl KDSETMODE failed"); WriteLn(stderr);
-      Abort;
-    END;
-
-    (*disable key processing by virtual console*)
-    REPEAT res := syscall4(54, tty, 4B45H, 4) UNTIL res # -4; (*ioctl(tty, KDSKBMODE, K_OFF)*)
-    IF res # 0 THEN
-      WriteString(stderr, "Error: ioctl KDSKBMODE failed"); WriteLn(stderr);
-      Abort;
-    END;
-
+    EnterTTY;
     CreateThread(KeyboardWatcher, 4096);
   END Init;
 
