@@ -2,8 +2,9 @@ MODULE Host; (*kolibrios*)
   IMPORT SYSTEM, Kernel, FileDir, Files;
 
   CONST
-    default* = 0; (*default cursor*)
-    frame* = 5; (*window frame size*)
+    default = 0; (*default cursor*)
+    frame = 5; (*window frame size*)
+    fbSize = 400000H; (*maximum framebuffer size*)
 
   TYPE
     BlitPar = RECORD
@@ -31,15 +32,27 @@ MODULE Host; (*kolibrios*)
         (*name: ARRAY 520 OF CHAR*)
       END ;
 
-    Handler* = PROCEDURE (ev: INTEGER; VAR continue: BOOLEAN);
+    Handler = PROCEDURE (ev: INTEGER; VAR continue: BOOLEAN);
+
+    Buffer = POINTER TO BufferDesc;
+    BufferDesc = RECORD data: ARRAY fbSize OF BYTE END;
 
   VAR
-    Base*, Width*, Height*, Stretch*: INTEGER;
-    maxw*, maxh*: INTEGER; (*recommended framebuffer size*)
-    hidden*: INTEGER; (*cursor handle*)
-    handle*: ARRAY 32 OF Handler; (*event handlers*)
+    Base, Width, Height, Stretch: INTEGER;
+    maxw, maxh: INTEGER; (*recommended framebuffer size*)
+    hidden: INTEGER; (*cursor handle*)
+    handle: ARRAY 32 OF Handler; (*event handlers*)
     scrx, scry, scrw, scrh, skinh: INTEGER; (*display work area, skin header size*)
     valid: BOOLEAN; (*framebuffer state*)
+
+    kbdCode: BYTE; (*last keyboard code read*)
+    Recd, Up, Shift, Ctrl, Ext: BOOLEAN;
+    KTabAdr: INTEGER;  (*keyboard code translation table*)
+    MX, MY: INTEGER; (*mouse limits and coords*)
+    MK: SET; (*mouse keys*)
+    MC, MCC: INTEGER;
+
+    buf: Buffer;
 
     Terminate: PROCEDURE; (*fn-1*)
     DefineWindow: PROCEDURE (xw, yh, style, hstyle: INTEGER; caption: ARRAY OF CHAR); (*fn0*)
@@ -58,14 +71,13 @@ MODULE Host; (*kolibrios*)
     DrawImageWithPal: PROCEDURE (bitmap, wh, xy, bpp, pal, row: INTEGER); (*fn65*)
     Blit: PROCEDURE (op: INTEGER; par: BlitPar); (*fn73*)
     FileCall: PROCEDURE (f: FilePar; VAR count: INTEGER): INTEGER; (*fn80*)
+    GetMouseState: PROCEDURE (): SET;
+    GetModifiers: PROCEDURE (): SET;
+    SetKeyboardMode: PROCEDURE (mode: INTEGER);
+    WriteChar: PROCEDURE (ch: CHAR); (*fn63.1*)
+    SysSleep: PROCEDURE (time: INTEGER); (*fn5*)
 
-  PROCEDURE Exit*;
-  BEGIN
-    Kernel.Install(SYSTEM.ADR(Terminate), 20H); (*terminate immediately on trap*)
-    Kernel.Install(SYSTEM.ADR(Terminate), 0); (*terminate immediately on abort*)
-    Files.RestoreList; (*delete temp files*)
-    Terminate
-  END Exit;
+  (* --------- utility --------- *)
 
   PROCEDURE BCDToClock (t, d: ARRAY OF BYTE): INTEGER;
   BEGIN RETURN ORD((((((d[3] * 256 + d[2]) MOD 100 * 10H + d[1])*20H + d[0])*20H + t[2])*40H + t[1])*40H + t[0])
@@ -102,6 +114,71 @@ MODULE Host; (*kolibrios*)
     END
   END FileInfo;
 
+  PROCEDURE Write*(stream, buf, size: INTEGER);
+    VAR i: INTEGER; ch: CHAR;
+  BEGIN
+    FOR i := 1 TO size DO
+      SYSTEM.GET(buf + i, ch);
+      WriteChar(ch);
+    END;
+  END Write;
+
+  PROCEDURE WriteStringAdr*(stream, p: INTEGER);
+    VAR len: INTEGER; ch: CHAR;
+  BEGIN
+    SYSTEM.GET(p, ch); INC(p);
+    WHILE ch # 0X DO
+      WriteChar(ch); SYSTEM.GET(p, ch); INC(p)
+    END;
+  END WriteStringAdr;
+
+  PROCEDURE WriteString*(stream: INTEGER; s: ARRAY OF CHAR);
+    VAR i: INTEGER; ch: CHAR;
+  BEGIN
+    ch := s[0]; i := 1;
+    WHILE ch # 0X DO
+      WriteChar(ch); ch := s[i]; INC(i)
+    END;
+  END WriteString;
+
+  PROCEDURE WriteLn*(stream: INTEGER);
+  BEGIN WriteChar(0DX); WriteChar(0AX);
+  END WriteLn;
+
+  (* --------- commands --------- *)
+
+  PROCEDURE Sleep*(ms: INTEGER);
+  BEGIN IF ms # 0 THEN SysSleep(ms DIV 10 MOD 20000000H) ELSE SysSleep(1) END;
+  END Sleep;
+
+  PROCEDURE Idle*;
+  BEGIN SysSleep(1)
+  END Idle;
+
+  PROCEDURE Abort*;
+  BEGIN
+    Kernel.Install(SYSTEM.ADR(Terminate), 20H); (*terminate immediately on trap*)
+    Kernel.Install(SYSTEM.ADR(Terminate), 0); (*terminate immediately on abort*)
+    Terminate
+  END Abort;
+
+  PROCEDURE Quit*(status: INTEGER);
+  BEGIN
+    Kernel.Install(SYSTEM.ADR(Terminate), 20H); (*terminate immediately on trap*)
+    Kernel.Install(SYSTEM.ADR(Terminate), 0); (*terminate immediately on abort*)
+    Files.RestoreList; (*delete temp files*)
+    Terminate
+  END Quit;
+
+  PROCEDURE Exit*;
+  BEGIN Quit(0)
+  END Exit;
+
+  PROCEDURE Sync*;
+  END Sync;
+
+  (* --------- display --------- *)
+
   PROCEDURE Repaint*(x, y, w, h: INTEGER);
     VAR par: BlitPar; winx, winy, winw, winh, Y: INTEGER;
   BEGIN
@@ -133,6 +210,28 @@ MODULE Host; (*kolibrios*)
     FinishRepaint
   END Repaint;
 
+  PROCEDURE GetBuffer*(VAR base, width, height, stride, depth: INTEGER; askDepth: INTEGER);
+  BEGIN base := 0; width := 0; height := 0; stride := 0; depth := 0;
+    IF askDepth = 32 THEN
+      NEW(buf);
+      IF buf # NIL THEN
+        base := SYSTEM.ADR(buf.data); width := maxw; height := maxh;
+        WHILE width * height * 4 > fbSize DO DEC(width); DEC(height) END;
+        width := width DIV 32 * 32; (*bug: for some reason System.Grow may broke system without this*)
+        stride := width*4; depth := 32;
+      END;
+    END;
+  END GetBuffer;
+
+  PROCEDURE SetBuffer*(base, w, h, stretch, bpp: INTEGER);
+  BEGIN
+    Base := base; Width := w; Height := h; Stretch := stretch;
+    valid := (base # 0) & (w > 0) & (h > 0) & (stretch > 0) & (bpp > 0);
+    Repaint(0, 0, Width, Height)
+  END SetBuffer;
+
+  (* --------- input --------- *)
+
   PROCEDURE UpdateVars;
     VAR lr, tb: INTEGER;
   BEGIN
@@ -146,7 +245,7 @@ MODULE Host; (*kolibrios*)
     maxh := scrh - frame - skinh
   END UpdateVars;
 
-  PROCEDURE HandleEvents*(wait: INTEGER; skip: BOOLEAN);
+  PROCEDURE HandleEvents(wait: INTEGER; skip: BOOLEAN);
     VAR event, temp: INTEGER; continue: BOOLEAN; p: Handler;
   BEGIN
     continue := TRUE;
@@ -174,22 +273,112 @@ MODULE Host; (*kolibrios*)
     UNTIL ~continue
   END HandleEvents;
 
-  PROCEDURE SetBuffer*(base, w, h, stretch, bpp: INTEGER);
+  PROCEDURE Handle(event: INTEGER; VAR continue: BOOLEAN);
+    VAR key: INTEGER;
   BEGIN
-    Base := base; Width := w; Height := h; Stretch := stretch;
-    valid := (base # 0) & (w > 0) & (h > 0) & (stretch > 0) & (bpp > 0);
-    Repaint(0, 0, Width, Height)
-  END SetBuffer;
+    IF event = 2 THEN (*key*)
+      continue := ~Recd;
+      IF ~Recd THEN
+        key := GetKey();
+        IF key MOD 256 = 0 THEN (*ignore hotkeys*)
+          (*kbdCode := key DIV 65536 MOD 128; Up := ODD(key DIV 800000H);
+          s := GetModifiers(); Shift := s * {0, 1} # {}; Ctrl := s * {2} # {}; Recd := ~Up*)
+          kbdCode := key DIV 256 MOD 128; Up := ODD(key DIV 32768);
+          IF (kbdCode = 42) OR (kbdCode = 54) THEN (*shift*) Shift := ~Up
+          ELSIF kbdCode = 29 THEN (*ctrl*) Ctrl := ~Up
+          ELSIF ~Up THEN Recd := TRUE (*real key going down*)
+          END
+        END
+      END
+    ELSIF event = 3 THEN (*button*)
+      key := GetButton();
+      IF key # 1 THEN
+        IF key DIV 256 MOD 1000000H = 1 THEN (*close*)
+          Exit
+        END
+      END;
+      continue := TRUE
+    ELSIF event = 6 THEN (*mouse*)
+      key := GetMouseWinCoords(); (*unmark event*)
+      continue := TRUE
+    END
+  END Handle;
 
   PROCEDURE SetHandler*(ev: INTEGER; h: Handler);
   BEGIN handle[ev] := h
   END SetHandler;
 
+  PROCEDURE Peek(wait: INTEGER);
+  BEGIN HandleEvents(wait, TRUE)
+  END Peek;
+
+  PROCEDURE Available*(): INTEGER;
+  BEGIN Peek(0);
+    RETURN ORD(Recd)
+  END Available;
+
+  PROCEDURE Read*(VAR ch: CHAR);
+  BEGIN
+    Peek(0); (*handle events*)
+    WHILE ~Recd DO Peek(-1) END; (*wait events*)
+    IF Shift OR Ctrl THEN INC(kbdCode, 80H) END; (*ctrl implies shift*)
+  (* ch := kbdTab[kbdCode]; *)
+    SYSTEM.GET(KTabAdr + kbdCode, ch);
+    IF Ctrl THEN ch := CHR(ORD(ch) MOD 20H) END;
+    Recd := FALSE
+  END Read;
+
+  PROCEDURE Mouse*(VAR keys: SET; VAR x, y: INTEGER);
+    VAR point, old, X, Y: INTEGER; s: SET;
+  BEGIN Peek(0); MK := {};
+    point := GetMouseWinCoords();
+    X := point DIV 65536; Y := Height - point * 65536 DIV 65536;
+    IF (X >= 0) & (Y >= 0) & (X < Width) & (Y < Height) THEN
+      s := GetMouseState(); MX := X; MY := Y;
+      IF 0 IN s THEN INCL(MK, 2) END;
+      IF 1 IN s THEN INCL(MK, 0) END;
+      IF 2 IN s THEN INCL(MK, 1) END;
+      IF MCC # MC THEN
+        old := InstallCursor(MCC); MC := MCC
+      END
+    ELSIF MC # default THEN
+      MCC := InstallCursor(default); MC := default
+    END;
+    IF MX < 0 THEN MX := 0 ELSIF MX >= Width THEN MX := Width-1 END;
+    IF MY < 0 THEN MY := 0 ELSIF MY >= Height THEN MY := Height-1 END;
+    keys := MK; x := MX; y := MY
+  END Mouse;
+
+  (* --------- init --------- *)
+
   PROCEDURE Init;
     VAR c: Cursor;
   BEGIN
+    Up := FALSE; Shift := FALSE; Ctrl := FALSE; Recd := FALSE;
+    KTabAdr := SYSTEM.ADR($
+      00 1B 31 32 33 34 35 36  37 38 39 30 2D 3D 08 09
+      71 77 65 72 74 79 75 69  6F 70 5B 5D 0D 00 61 73
+      64 66 67 68 6A 6B 6C 3B  27 60 00 5C 7A 78 63 76
+      62 6E 6D 2C 2E 2F 00 00  00 20 00 1A 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 7F 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 1B 21 40 23 24 25 5E  26 2A 28 29 5F 2B 08 09
+      51 57 45 52 54 59 55 49  4F 50 7B 7D 0D 00 41 53
+      44 46 47 48 4A 4B 4C 3A  22 7E 00 7C 5A 58 43 56
+      42 4E 4D 3C 3E 3F 00 00  00 20 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 7F 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00
+      00 00 00 00 00 00 00 00  00 00 00 00 00 00 00 00$);
     NEW(c); hidden := LoadCursor(SYSTEM.ADR(c.bitmap), 2);
-    UpdateVars
+    UpdateVars;
+    MCC := hidden;
+    SetKeyboardMode(1); (*scancode-mode*)
+    SetHandler(2, Handle); (*key*)
+    SetHandler(3, Handle); (*button*)
+    SetHandler(6, Handle); (*mouse*)
   END Init;
 
 BEGIN
@@ -210,5 +399,10 @@ BEGIN
   SYSTEM.PUT(SYSTEM.ADR(DrawImageWithPal), SYSTEM.ADR($55 89E5 B841000000 8B5D1C 8B4D18 8B5514 8B7510 8B7D0C 8B6D08 CD40 5D C21800$));
   SYSTEM.PUT(SYSTEM.ADR(Blit), SYSTEM.ADR($55 89E5 B849000000 8B5D10 8B4D0C CD40 5D C20C00$));
   SYSTEM.PUT(SYSTEM.ADR(FileCall), SYSTEM.ADR($55 89E5 B850000000 8B5D10 CD40 8B4D08 8919 5D C20C00 6690$));
+  SYSTEM.PUT(SYSTEM.ADR(GetMouseState), SYSTEM.ADR($B825000000 BB02000000 CD40 C3 6690 90$));
+  SYSTEM.PUT(SYSTEM.ADR(GetModifiers), SYSTEM.ADR($B842000000 BB03000000 CD40 C3 6690 90$));
+  SYSTEM.PUT(SYSTEM.ADR(SetKeyboardMode), SYSTEM.ADR($55 89E5 B842000000 BB01000000 8B4D08 CD40 5D C20400 90$));
+  SYSTEM.PUT(SYSTEM.ADR(WriteChar), SYSTEM.ADR($55 B83F000000 BB01000000 8B4C2408 CD40 5D C20400 909090$));
+  SYSTEM.PUT(SYSTEM.ADR(SysSleep), SYSTEM.ADR($55 B805000000 8B5C2408 CD40 5D C20400$));
   Init;
 END Host.
